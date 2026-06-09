@@ -1,0 +1,2931 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+interpreter.py
+lexer.py
+main.py
+memory.py
+parser.py
+repl.py
+smallc_builtins.py
+symtable.py
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="interpreter.py">
+"""
+Small-C Interpreter
+走訪 AST 節點並執行，整合 Memory、SymbolTable、Builtins。
+"""
+
+import sys
+from memory import Memory, MemoryError
+from symtable import SymbolTable, VarEntry, FuncEntry, SymbolError
+from smallc_builtins import (register_builtins, call_builtin,
+                              is_builtin, ExitCalled, BuiltinError)
+from parser import (
+    Program, FuncDef, VarDecl, Define, Block,
+    IfStmt, WhileStmt, ForStmt, DoWhileStmt,
+    BreakStmt, ContinueStmt, ReturnStmt, ExprStmt,
+    BinOp, UnaryOp, Assign, Ident, ArrayIndex,
+    FuncCall, IntLit, CharLit, StrLit,
+)
+from lexer import tokenize, LexerError, TokenType
+from parser import parse, parse_stmts, ParseError, Parser
+
+
+# ── 控制流例外 ──
+class BreakSignal(Exception):    pass
+class ContinueSignal(Exception): pass
+class ReturnSignal(Exception):
+    def __init__(self, value=0): self.value = value
+
+class RuntimeError_(Exception):
+    def __init__(self, msg, line=0):
+        super().__init__(msg)
+        self.line = line
+
+
+class Interpreter:
+    def __init__(self, trace=False, input_fn=None):
+        self.mem      = Memory()
+        self.sym      = SymbolTable()
+        self.trace    = trace
+        self.input_fn = input_fn
+        register_builtins(self.sym)
+
+    def reset(self):
+        self.mem = Memory()
+        self.sym.reset()
+        register_builtins(self.sym)
+
+    # ── 完整程式執行 ──
+
+    def run_program(self, source: str):
+        self.reset()
+        try:
+            tokens = tokenize(source)
+        except LexerError as e:
+            raise RuntimeError_(f"Lexer error: {e}", getattr(e, 'line', 0))
+        try:
+            ast = parse(tokens, self.sym.all_defines())
+        except ParseError as e:
+            raise RuntimeError_(f"Syntax error at line {getattr(e,'line',0)}: {e}", getattr(e,'line',0))
+
+        for decl in ast.decls:
+            self._register_top(decl)
+        for decl in ast.decls:
+            if isinstance(decl, VarDecl):
+                self._init_global_var(decl)
+
+        fe = self.sym.lookup_func_safe('main')
+        if fe is None or fe.is_builtin:
+            raise RuntimeError_("No main() function defined.")
+
+        try:
+            ret = self._call_user_func(fe, [])
+            code = ret if ret is not None else 0
+        except ReturnSignal as r:
+            code = r.value
+        except ExitCalled as e:
+            print(f"Program exited with return value {e.code}.")
+            return
+
+        if fe.rtype == 'int':
+            print(f"Program exited with return value {code}.")
+
+    def _register_top(self, decl):
+        if isinstance(decl, FuncDef):
+            entry = FuncEntry(rtype=decl.rtype, params=decl.params,
+                              node=decl, is_builtin=False)
+            self.sym.declare_func(decl.name, entry, decl.line)
+        elif isinstance(decl, VarDecl):
+            entry = VarEntry(dtype=decl.dtype, is_ptr=decl.is_ptr,
+                             is_arr=(decl.size is not None), size=1, addr=0)
+            self.sym.declare_var(decl.name, entry, decl.line)
+        elif isinstance(decl, Define):
+            self.sym.define(decl.name, self._eval_define_str(decl.value_str))
+
+    def _eval_define_str(self, s: str) -> int:
+        s = s.strip()
+        try:
+            return int(s, 16) if s.startswith(('0x','0X')) else int(s)
+        except ValueError:
+            return 0
+
+    def _init_global_var(self, decl: VarDecl):
+        entry = self.sym.lookup_var(decl.name, decl.line)
+        if decl.size is not None:
+            size_val  = self._eval_expr(decl.size)
+            elem_size = 1 if decl.dtype == 'char' else 4
+            addr = self.mem.alloc(size_val * elem_size)
+            entry.is_arr = True; entry.size = size_val
+            entry.addr   = addr; entry.cell_size = elem_size
+        else:
+            cell = 1 if decl.dtype == 'char' else 4
+            addr = self.mem.alloc(cell)
+            entry.addr = addr
+            if decl.init is not None:
+                val = self._eval_expr(decl.init)
+                self.mem.write(addr, int(val))
+
+    # ── 互動模式 ──
+
+    def exec_interactive(self, source: str):
+        source = source.strip()
+        if not source:
+            return
+        try:
+            tokens = tokenize(source)
+        except LexerError as e:
+            raise RuntimeError_(f"Lexer error: {e}", getattr(e,'line',0))
+
+        try:
+            p = Parser(tokens, self.sym.all_defines())
+            top_types = (TokenType.INT, TokenType.CHAR,
+                         TokenType.VOID, TokenType.DEFINE)
+            if p.check(*top_types):
+                decls = []
+                while not p.check(TokenType.EOF):
+                    decls.extend(p._parse_top_level())
+                for d in decls:
+                    if isinstance(d, FuncDef):
+                        self._register_top(d)
+                    elif isinstance(d, VarDecl):
+                        self._register_top(d)
+                        self._init_global_var(d)
+                    elif isinstance(d, Define):
+                        self._register_top(d)
+                return
+            stmts = []
+            while not p.check(TokenType.EOF):
+                stmts.append(p._parse_stmt())
+        except ParseError as e:
+            raise RuntimeError_(f"Syntax error: {e}", getattr(e,'line',0))
+
+        for stmt in stmts:
+            self._exec_stmt(stmt)
+
+    # ── 語法檢查 ──
+
+    def check_syntax(self, source: str) -> list:
+        errors = []
+        try:
+            tokens = tokenize(source)
+        except LexerError as e:
+            errors.append(f"Lexer error at line {getattr(e,'line',0)}: {e}")
+            return errors
+        try:
+            parse(tokens, self.sym.all_defines())
+        except ParseError as e:
+            errors.append(f"Error at line {getattr(e,'line',0)}: {e}")
+        return errors
+
+    # ── 陳述句執行 ──
+
+    def _exec_stmt(self, stmt):
+        if self.trace and hasattr(stmt, 'line') and stmt.line:
+            print(f"[line {stmt.line}] {self._stmt_src(stmt)}")
+
+        if isinstance(stmt, ExprStmt):
+            self._eval_expr(stmt.expr)
+
+        elif isinstance(stmt, VarDecl):
+            self._exec_var_decl(stmt)
+
+        elif isinstance(stmt, Block):
+            self.sym.push_scope()
+            mark = self.mem.mark()
+            try:
+                for s in stmt.stmts:
+                    self._exec_stmt(s)
+            finally:
+                self.sym.pop_scope()
+                self.mem.free_after(mark)
+
+        elif isinstance(stmt, IfStmt):
+            if self._eval_expr(stmt.cond):
+                self._exec_stmt(stmt.then_branch)
+            elif stmt.else_branch:
+                self._exec_stmt(stmt.else_branch)
+
+        elif isinstance(stmt, WhileStmt):
+            while self._eval_expr(stmt.cond):
+                try:
+                    self._exec_stmt(stmt.body)
+                except BreakSignal:
+                    break
+                except ContinueSignal:
+                    continue
+
+        elif isinstance(stmt, ForStmt):
+            in_scope = False
+            mark = None
+            if stmt.init:
+                if isinstance(stmt.init, VarDecl):
+                    self.sym.push_scope()
+                    mark = self.mem.mark()
+                    self._exec_var_decl(stmt.init)
+                    in_scope = True
+                else:
+                    self._eval_expr(stmt.init.expr)
+            try:
+                while True:
+                    if stmt.cond and not self._eval_expr(stmt.cond):
+                        break
+                    try:
+                        self._exec_stmt(stmt.body)
+                    except BreakSignal:
+                        break
+                    except ContinueSignal:
+                        pass
+                    if stmt.update:
+                        self._eval_expr(stmt.update)
+            finally:
+                if in_scope:
+                    self.sym.pop_scope()
+                    self.mem.free_after(mark)
+
+        elif isinstance(stmt, DoWhileStmt):
+            while True:
+                try:
+                    self._exec_stmt(stmt.body)
+                except BreakSignal:
+                    break
+                except ContinueSignal:
+                    pass
+                if not self._eval_expr(stmt.cond):
+                    break
+
+        elif isinstance(stmt, BreakStmt):
+            raise BreakSignal()
+
+        elif isinstance(stmt, ContinueStmt):
+            raise ContinueSignal()
+
+        elif isinstance(stmt, ReturnStmt):
+            val = self._eval_expr(stmt.value) if stmt.value else 0
+            raise ReturnSignal(val)
+
+        elif isinstance(stmt, Define):
+            self.sym.define(stmt.name, self._eval_define_str(stmt.value_str))
+
+        else:
+            raise RuntimeError_(f"Unknown stmt: {type(stmt).__name__}")
+
+    def _exec_var_decl(self, decl: VarDecl):
+        if decl.size is not None:
+            size_val  = self._eval_expr(decl.size)
+            elem_size = 1 if decl.dtype == 'char' else 4
+            addr = self.mem.alloc(size_val * elem_size)
+            entry = VarEntry(dtype=decl.dtype, is_arr=True, size=size_val,
+                             addr=addr, cell_size=elem_size)
+            self.sym.declare_var(decl.name, entry, decl.line)
+            if decl.init is not None:
+                val = self._eval_expr(decl.init)
+                if isinstance(val, str):
+                    self.mem.write_string(addr, val)
+        else:
+            cell = 1 if decl.dtype == 'char' else 4
+            addr = self.mem.alloc(cell)
+            entry = VarEntry(dtype=decl.dtype, is_ptr=decl.is_ptr,
+                             addr=addr, cell_size=cell)
+            self.sym.declare_var(decl.name, entry, decl.line)
+            if decl.init is not None:
+                val = self._eval_expr(decl.init)
+                if isinstance(val, str):
+                    self.mem.write_string(addr, val)
+                else:
+                    self.mem.write(addr, int(val))
+
+    # ── 表達式求值 ──
+
+    def _eval_expr(self, node):
+        if isinstance(node, IntLit):  return node.value
+        if isinstance(node, CharLit): return node.value
+        if isinstance(node, StrLit):
+            return self.mem.alloc_string_literal(node.value)
+
+        if isinstance(node, Ident):
+            entry = self.sym.lookup_var(node.name, node.line)
+            if entry.is_arr:
+                return entry.addr
+            return self.mem.read(entry.addr)
+
+        if isinstance(node, ArrayIndex):
+            addr = self._eval_lvalue_addr(node)
+            return self.mem.read(addr)
+
+        if isinstance(node, UnaryOp):  return self._eval_unary(node)
+        if isinstance(node, BinOp):    return self._eval_binop(node)
+        if isinstance(node, Assign):   return self._eval_assign(node)
+        if isinstance(node, FuncCall): return self._eval_func_call(node)
+
+        raise RuntimeError_(f"Unknown expr: {type(node).__name__}")
+
+    def _eval_unary(self, node):
+        op = node.op
+        if op == '-':     return -self._eval_expr(node.operand)
+        if op == '!':     return 0 if self._eval_expr(node.operand) else 1
+        if op == '~':     return ~self._eval_expr(node.operand)
+        if op == '&':     return self._eval_lvalue_addr(node.operand)
+        if op == '*':
+            ptr = self._eval_expr(node.operand)
+            return self.mem.read(int(ptr))
+        if op == '++pre':
+            addr = self._eval_lvalue_addr(node.operand)
+            val  = self.mem.read(addr) + 1
+            self.mem.write(addr, val); return val
+        if op == '--pre':
+            addr = self._eval_lvalue_addr(node.operand)
+            val  = self.mem.read(addr) - 1
+            self.mem.write(addr, val); return val
+        raise RuntimeError_(f"Unknown unary: {op}")
+
+    def _eval_binop(self, node):
+        op = node.op
+        if op == '&&':
+            return 1 if (self._eval_expr(node.left) and self._eval_expr(node.right)) else 0
+        if op == '||':
+            return 1 if (self._eval_expr(node.left) or self._eval_expr(node.right)) else 0
+        L = self._eval_expr(node.left)
+        R = self._eval_expr(node.right)
+        if op == '+':  return L + R
+        if op == '-':  return L - R
+        if op == '*':  return L * R
+        if op == '/':
+            if R == 0: raise RuntimeError_("Runtime error: division by zero", node.line)
+            return int(L / R)
+        if op == '%':
+            if R == 0: raise RuntimeError_("Runtime error: division by zero", node.line)
+            return int(L) % int(R)
+        if op == '<':  return 1 if L <  R else 0
+        if op == '<=': return 1 if L <= R else 0
+        if op == '>':  return 1 if L >  R else 0
+        if op == '>=': return 1 if L >= R else 0
+        if op == '==': return 1 if L == R else 0
+        if op == '!=': return 1 if L != R else 0
+        if op == '&':  return int(L) & int(R)
+        if op == '|':  return int(L) | int(R)
+        if op == '^':  return int(L) ^ int(R)
+        if op == '<<': return int(L) << int(R)
+        if op == '>>': return int(L) >> int(R)
+        raise RuntimeError_(f"Unknown binop: {op}")
+
+    def _eval_assign(self, node):
+        rval = self._eval_expr(node.value)
+        addr = self._eval_lvalue_addr(node.target)
+        if node.op != '=':
+            old = self.mem.read(addr)
+            op  = node.op[0]
+            if op == '+': rval = old + rval
+            elif op == '-': rval = old - rval
+            elif op == '*': rval = old * rval
+            elif op == '/':
+                if rval == 0: raise RuntimeError_("Runtime error: division by zero")
+                rval = int(old / rval)
+            elif op == '%':
+                if rval == 0: raise RuntimeError_("Runtime error: division by zero")
+                rval = old % rval
+        self.mem.write(addr, int(rval))
+        return rval
+
+    def _eval_func_call(self, node):
+        args = [self._eval_expr(a) for a in node.args]
+        name = node.name
+        if is_builtin(name):
+            try:
+                return call_builtin(name, args, self.mem, self.input_fn)
+            except BuiltinError as e:
+                raise RuntimeError_(str(e), node.line)
+        fe = self.sym.lookup_func(name, node.line)
+        try:
+            ret = self._call_user_func(fe, args)
+            return ret if ret is not None else 0
+        except ReturnSignal as r:
+            return r.value
+
+    def _call_user_func(self, fe, args):
+        node = fe.node
+        self.sym.push_scope()
+        mark = self.mem.mark()
+        try:
+            for i, (dtype, is_ptr, pname) in enumerate(fe.params):
+                cell = 1 if (dtype == 'char' and not is_ptr) else 4
+                addr = self.mem.alloc(cell)
+                val  = args[i] if i < len(args) else 0
+                self.mem.write(addr, int(val))
+                entry = VarEntry(dtype=dtype, is_ptr=is_ptr,
+                                 addr=addr, cell_size=cell)
+                self.sym.declare_var(pname, entry)
+            for stmt in node.body.stmts:
+                self._exec_stmt(stmt)
+        except ReturnSignal as r:
+            return r.value
+        finally:
+            self.sym.pop_scope()
+            self.mem.free_after(mark)
+        return 0
+
+    # ── LValue 位址 ──
+
+    def _eval_lvalue_addr(self, node) -> int:
+        if isinstance(node, Ident):
+            return self.sym.lookup_var(node.name, node.line).addr
+        if isinstance(node, ArrayIndex):
+            # _eval_expr handles both: array name → base addr, pointer → pointed addr
+            base  = self._eval_expr(node.array)
+            idx   = self._eval_expr(node.index)
+            entry = self._get_arr_entry(node.array)
+            elem  = 4  # default int size
+            if entry:
+                if entry.is_arr:
+                    elem = entry.elem_size()
+                    if idx < 0 or idx >= entry.size:
+                        raise RuntimeError_(
+                            f"Runtime error: array index out of bounds "
+                            f"(index {idx}, size {entry.size})", node.line)
+                elif entry.is_ptr:
+                    elem = 4  # pointer to int → 4 bytes per element
+                else:
+                    elem = entry.elem_size()
+            return base + idx * elem
+        if isinstance(node, UnaryOp) and node.op == '*':
+            return self._eval_expr(node.operand)
+        raise RuntimeError_(f"Not an lvalue: {type(node).__name__}",
+                            getattr(node,'line',0))
+
+    def _get_arr_entry(self, node):
+        if isinstance(node, Ident):
+            return self.sym.lookup_var_safe(node.name)
+        return None
+
+    # ── VARS / FUNCS 輸出 ──
+
+    def dump_vars(self) -> str:
+        lines = []
+        seen  = set()
+        for scope in reversed(self.sym._scopes):
+            for name, entry in scope.items():
+                if name in seen: continue
+                seen.add(name)
+                lines.append(self._format_var(name, entry))
+        return '\n'.join(lines) if lines else '(no variables)'
+
+    def _format_var(self, name, entry):
+        ptr = '*' if entry.is_ptr else ''
+        if entry.is_arr:
+            vals = []
+            for i in range(min(entry.size, 10)):
+                try:    vals.append(str(self.mem.read(entry.addr + i * entry.elem_size())))
+                except: vals.append('?')
+            ell = ', ...' if entry.size > 10 else ''
+            return f"  {entry.dtype} {ptr}{name}[{entry.size}] = {{{', '.join(vals)}{ell}}}"
+        else:
+            try:
+                val = self.mem.read(entry.addr)
+                if entry.dtype == 'char' and not entry.is_ptr:
+                    c = chr(val & 0xFF) if 32 <= (val & 0xFF) <= 126 else '?'
+                    return f"  {entry.dtype} {ptr}{name} = {val} ('{c}')"
+                return f"  {entry.dtype} {ptr}{name} = {val}"
+            except:
+                return f"  {entry.dtype} {ptr}{name} = (uninitialized)"
+
+    def dump_funcs(self) -> str:
+        lines = []
+        for name, fe in self.sym.all_funcs().items():
+            if not fe.is_builtin:
+                p = self._fmt_params(fe.params)
+                ln = fe.node.line if fe.node else '?'
+                lines.append(f"  {fe.rtype:<6} {name}({p})  line {ln}")
+        lines.append("  --- built-in functions ---")
+        for name, fe in self.sym.all_funcs().items():
+            if fe.is_builtin:
+                p = self._fmt_params(fe.params)
+                lines.append(f"  {fe.rtype:<6} {name}({p})  [built-in]")
+        return '\n'.join(lines)
+
+    def _fmt_params(self, params) -> str:
+        parts = []
+        for item in params:
+            if isinstance(item, tuple) and len(item) == 3:
+                dtype, is_ptr, pname = item
+                parts.append(f"{dtype} {'*' if is_ptr else ''}{pname}")
+        return ', '.join(parts)
+
+    # ── TRACE 輔助 ──
+
+    def _stmt_src(self, stmt) -> str:
+        if isinstance(stmt, ExprStmt):    return self._expr_src(stmt.expr) + ';'
+        if isinstance(stmt, VarDecl):     return f"{stmt.dtype} {stmt.name};"
+        if isinstance(stmt, WhileStmt):   return f"while ({self._expr_src(stmt.cond)}) {{"
+        if isinstance(stmt, IfStmt):      return f"if ({self._expr_src(stmt.cond)})"
+        if isinstance(stmt, ReturnStmt):
+            return f"return {self._expr_src(stmt.value) if stmt.value else ''};"
+        if isinstance(stmt, BreakStmt):    return "break;"
+        if isinstance(stmt, ContinueStmt): return "continue;"
+        return type(stmt).__name__
+
+    def _expr_src(self, node) -> str:
+        if node is None:              return ''
+        if isinstance(node, IntLit):  return str(node.value)
+        if isinstance(node, CharLit): return repr(chr(node.value & 0xFF))
+        if isinstance(node, StrLit):  return repr(node.value)
+        if isinstance(node, Ident):   return node.name
+        if isinstance(node, BinOp):
+            return f"{self._expr_src(node.left)} {node.op} {self._expr_src(node.right)}"
+        if isinstance(node, UnaryOp):
+            return f"{node.op}{self._expr_src(node.operand)}"
+        if isinstance(node, Assign):
+            return f"{self._expr_src(node.target)} {node.op} {self._expr_src(node.value)}"
+        if isinstance(node, FuncCall):
+            args = ', '.join(self._expr_src(a) for a in node.args)
+            return f"{node.name}({args})"
+        if isinstance(node, ArrayIndex):
+            return f"{self._expr_src(node.array)}[{self._expr_src(node.index)}]"
+        return '...'
+</file>
+
+<file path="lexer.py">
+"""
+Small-C Lexer
+Tokenizes Small-C source code into a stream of tokens.
+"""
+
+import re
+from enum import Enum, auto
+
+class TokenType(Enum):
+    # Literals
+    INT_LIT    = auto()
+    CHAR_LIT   = auto()
+    STR_LIT    = auto()
+    HEX_LIT    = auto()
+    IDENT      = auto()
+
+    # Keywords
+    INT        = auto()
+    CHAR       = auto()
+    VOID       = auto()
+    IF         = auto()
+    ELSE       = auto()
+    WHILE      = auto()
+    FOR        = auto()
+    DO         = auto()
+    BREAK      = auto()
+    CONTINUE   = auto()
+    RETURN     = auto()
+    DEFINE     = auto()  # #define
+
+    # Operators
+    PLUS       = auto()  # +
+    MINUS      = auto()  # -
+    STAR       = auto()  # *
+    SLASH      = auto()  # /
+    PERCENT    = auto()  # %
+    AMP        = auto()  # &
+    PIPE       = auto()  # |
+    CARET      = auto()  # ^
+    TILDE      = auto()  # ~
+    BANG       = auto()  # !
+    LSHIFT     = auto()  # <<
+    RSHIFT     = auto()  # >>
+    AND        = auto()  # &&
+    OR         = auto()  # ||
+    EQ         = auto()  # ==
+    NEQ        = auto()  # !=
+    LT         = auto()  # <
+    LE         = auto()  # <=
+    GT         = auto()  # >
+    GE         = auto()  # >=
+    ASSIGN     = auto()  # =
+    PLUS_EQ    = auto()  # +=
+    MINUS_EQ   = auto()  # -=
+    STAR_EQ    = auto()  # *=
+    SLASH_EQ   = auto()  # /=
+    PERCENT_EQ = auto()  # %=
+    INC        = auto()  # ++
+    DEC        = auto()  # --
+
+    # Delimiters
+    LPAREN     = auto()  # (
+    RPAREN     = auto()  # )
+    LBRACE     = auto()  # {
+    RBRACE     = auto()  # }
+    LBRACKET   = auto()  # [
+    RBRACKET   = auto()  # ]
+    SEMICOLON  = auto()  # ;
+    COMMA      = auto()  # ,
+
+    # Special
+    EOF        = auto()
+
+
+KEYWORDS = {
+    'int': TokenType.INT,
+    'char': TokenType.CHAR,
+    'void': TokenType.VOID,
+    'if': TokenType.IF,
+    'else': TokenType.ELSE,
+    'while': TokenType.WHILE,
+    'for': TokenType.FOR,
+    'do': TokenType.DO,
+    'break': TokenType.BREAK,
+    'continue': TokenType.CONTINUE,
+    'return': TokenType.RETURN,
+}
+
+
+class Token:
+    def __init__(self, type: TokenType, value, line: int = 0, col: int = 0):
+        self.type = type
+        self.value = value
+        self.line = line
+        self.col = col
+
+    def __repr__(self):
+        return f'Token({self.type}, {self.value!r}, line={self.line})'
+
+
+class LexerError(Exception):
+    def __init__(self, msg, line=0, col=0):
+        super().__init__(msg)
+        self.line = line
+        self.col = col
+
+
+def _parse_escape(s, pos):
+    """Parse escape sequence starting after backslash. Returns (char, new_pos)."""
+    if pos >= len(s):
+        raise LexerError("Unterminated escape sequence")
+    c = s[pos]
+    pos += 1
+    mapping = {'n': '\n', 't': '\t', '0': '\0', '\\': '\\', "'": "'", '"': '"', 'r': '\r'}
+    if c in mapping:
+        return mapping[c], pos
+    raise LexerError(f"Unknown escape sequence: \\{c}")
+
+
+def tokenize(source: str, start_line: int = 1):
+    """Tokenize source string, returning list of Token objects."""
+    tokens = []
+    i = 0
+    line = start_line
+    line_start = 0
+
+    def col():
+        return i - line_start + 1
+
+    n = len(source)
+
+    while i < n:
+        # Skip whitespace
+        if source[i] in ' \t\r':
+            i += 1
+            continue
+
+        if source[i] == '\n':
+            line += 1
+            i += 1
+            line_start = i
+            continue
+
+        # Block comment
+        if source[i:i+2] == '/*':
+            i += 2
+            while i < n and source[i:i+2] != '*/':
+                if source[i] == '\n':
+                    line += 1
+                    line_start = i + 1
+                i += 1
+            if i >= n:
+                raise LexerError("Unterminated block comment", line, col())
+            i += 2
+            continue
+
+        # Line comment
+        if source[i:i+2] == '//':
+            while i < n and source[i] != '\n':
+                i += 1
+            continue
+
+        # #define
+        if source[i] == '#':
+            # Read until end of line
+            rest = source[i:]
+            m = re.match(r'#\s*define\s+([A-Za-z_]\w*)\s+(.+)', rest)
+            if m:
+                name = m.group(1)
+                val_str = m.group(2).strip()
+                tok = Token(TokenType.DEFINE, (name, val_str), line, col())
+                tokens.append(tok)
+                i += m.end()
+            else:
+                # Skip unknown preprocessor directive
+                while i < n and source[i] != '\n':
+                    i += 1
+            continue
+
+        c = source[i]
+
+        # String literal
+        if c == '"':
+            i += 1
+            s = []
+            while i < n and source[i] != '"':
+                if source[i] == '\\':
+                    i += 1
+                    ch, i = _parse_escape(source, i)
+                    s.append(ch)
+                elif source[i] == '\n':
+                    raise LexerError("Unterminated string literal", line, col())
+                else:
+                    s.append(source[i])
+                    i += 1
+            if i >= n:
+                raise LexerError("Unterminated string literal", line, col())
+            i += 1  # closing "
+            tokens.append(Token(TokenType.STR_LIT, ''.join(s), line, col()))
+            continue
+
+        # Char literal
+        if c == "'":
+            i += 1
+            if i >= n:
+                raise LexerError("Unterminated char literal", line, col())
+            if source[i] == '\\':
+                i += 1
+                ch, i = _parse_escape(source, i)
+            else:
+                ch = source[i]
+                i += 1
+            if i >= n or source[i] != "'":
+                raise LexerError("Unterminated char literal", line, col())
+            i += 1
+            tokens.append(Token(TokenType.CHAR_LIT, ord(ch), line, col()))
+            continue
+
+        # Hex literal
+        if source[i:i+2] in ('0x', '0X'):
+            j = i + 2
+            while j < n and source[j] in '0123456789abcdefABCDEF':
+                j += 1
+            val = int(source[i:j], 16)
+            tokens.append(Token(TokenType.INT_LIT, val, line, col()))
+            i = j
+            continue
+
+        # Integer literal
+        if c.isdigit():
+            j = i
+            while j < n and source[j].isdigit():
+                j += 1
+            tokens.append(Token(TokenType.INT_LIT, int(source[i:j]), line, col()))
+            i = j
+            continue
+
+        # Identifier or keyword
+        if c.isalpha() or c == '_':
+            j = i
+            while j < n and (source[j].isalnum() or source[j] == '_'):
+                j += 1
+            word = source[i:j]
+            tt = KEYWORDS.get(word, TokenType.IDENT)
+            tokens.append(Token(tt, word, line, col()))
+            i = j
+            continue
+
+        # Two-char operators
+        two = source[i:i+2]
+        two_map = {
+            '<<': TokenType.LSHIFT,
+            '>>': TokenType.RSHIFT,
+            '&&': TokenType.AND,
+            '||': TokenType.OR,
+            '==': TokenType.EQ,
+            '!=': TokenType.NEQ,
+            '<=': TokenType.LE,
+            '>=': TokenType.GE,
+            '+=': TokenType.PLUS_EQ,
+            '-=': TokenType.MINUS_EQ,
+            '*=': TokenType.STAR_EQ,
+            '/=': TokenType.SLASH_EQ,
+            '%=': TokenType.PERCENT_EQ,
+            '++': TokenType.INC,
+            '--': TokenType.DEC,
+        }
+        if two in two_map:
+            tokens.append(Token(two_map[two], two, line, col()))
+            i += 2
+            continue
+
+        # Single-char operators/delimiters
+        one_map = {
+            '+': TokenType.PLUS,
+            '-': TokenType.MINUS,
+            '*': TokenType.STAR,
+            '/': TokenType.SLASH,
+            '%': TokenType.PERCENT,
+            '&': TokenType.AMP,
+            '|': TokenType.PIPE,
+            '^': TokenType.CARET,
+            '~': TokenType.TILDE,
+            '!': TokenType.BANG,
+            '<': TokenType.LT,
+            '>': TokenType.GT,
+            '=': TokenType.ASSIGN,
+            '(': TokenType.LPAREN,
+            ')': TokenType.RPAREN,
+            '{': TokenType.LBRACE,
+            '}': TokenType.RBRACE,
+            '[': TokenType.LBRACKET,
+            ']': TokenType.RBRACKET,
+            ';': TokenType.SEMICOLON,
+            ',': TokenType.COMMA,
+        }
+        if c in one_map:
+            tokens.append(Token(one_map[c], c, line, col()))
+            i += 1
+            continue
+
+        raise LexerError(f"Unexpected character: {c!r}", line, col())
+
+    tokens.append(Token(TokenType.EOF, None, line, col()))
+    return tokens
+</file>
+
+<file path="main.py">
+"""
+Small-C Interactive Interpreter
+Entry point — python3 main.py
+"""
+
+import sys
+from repl import Repl
+
+
+def main():
+    # 若有命令列引數，直接執行檔案（非互動模式）
+    if len(sys.argv) > 1:
+        filename = sys.argv[1]
+        try:
+            with open(filename, 'r', encoding='utf-8') as f:
+                source = f.read()
+        except FileNotFoundError:
+            print(f"Error: file '{filename}' not found.")
+            sys.exit(1)
+
+        from interpreter import Interpreter, RuntimeError_
+        from smallc_builtins import ExitCalled
+        interp = Interpreter()
+        try:
+            interp.run_program(source)
+        except RuntimeError_ as e:
+            print(e)
+            sys.exit(1)
+        except ExitCalled as e:
+            sys.exit(e.code)
+        return
+
+    # 互動模式
+    repl = Repl()
+    repl.run()
+
+
+if __name__ == '__main__':
+    main()
+</file>
+
+<file path="memory.py">
+"""
+Small-C Memory Model
+用 Python dict 模擬一塊線性記憶體空間。
+
+設計原則：
+  - 每個 int  佔 4 個位元組（cell）
+  - 每個 char 佔 1 個位元組（cell）
+  - 陣列/字串在記憶體中連續存放
+  - 指標值 = 模擬位址（整數偏移量）
+  - 位址從 1000 開始分配（0 保留為 NULL）
+
+對外介面：
+  mem = Memory()
+  addr = mem.alloc(size)          # 分配 size 個 cell，回傳起始位址
+  mem.write(addr, value)          # 寫入單一 cell
+  mem.read(addr)                  # 讀取單一 cell
+  mem.write_array(addr, values)   # 批次寫入
+  mem.read_string(addr)           # 從位址讀取 null-terminated 字串
+  mem.write_string(addr, s)       # 寫入字串（含結尾 \\0）
+  mem.free_after(mark)            # 釋放 mark 之後的所有位址（函式返回用）
+  mem.mark()                      # 回傳目前分配高水位（用於 stack frame）
+"""
+
+NULL = 0
+HEAP_START = 1000
+
+
+class MemoryError(Exception):
+    def __init__(self, msg, addr=None):
+        super().__init__(msg)
+        self.addr = addr
+
+
+class Memory:
+    def __init__(self):
+        self._cells: dict[int, int] = {}   # addr → value
+        self._next_addr: int = HEAP_START
+        self._alloc_log: list[tuple[int,int]] = []  # (addr, size) 紀錄
+
+    # ──────────────────────────────────────────
+    # 分配
+    # ──────────────────────────────────────────
+
+    def alloc(self, size: int) -> int:
+        """分配 size 個 cell，初始化為 0，回傳起始位址。"""
+        if size <= 0:
+            raise MemoryError(f"alloc: invalid size {size}")
+        addr = self._next_addr
+        for i in range(size):
+            self._cells[addr + i] = 0
+        self._next_addr += size
+        self._alloc_log.append((addr, size))
+        return addr
+
+    def mark(self) -> int:
+        """回傳目前分配高水位，用於 stack frame 標記。"""
+        return self._next_addr
+
+    def free_after(self, mark: int):
+        """釋放 mark 之後分配的所有 cell（函式返回時回收區域變數）。"""
+        keys_to_del = [k for k in self._cells if k >= mark]
+        for k in keys_to_del:
+            del self._cells[k]
+        self._next_addr = mark
+        # 清除 alloc_log 中 mark 之後的記錄
+        self._alloc_log = [(a, s) for a, s in self._alloc_log if a < mark]
+
+    # ──────────────────────────────────────────
+    # 讀寫
+    # ──────────────────────────────────────────
+
+    def write(self, addr: int, value: int):
+        """寫入單一 cell。"""
+        if addr == NULL:
+            raise MemoryError("null pointer dereference", addr)
+        if addr not in self._cells:
+            raise MemoryError(f"write to unallocated address {addr}", addr)
+        # 截斷到 32-bit 有號整數範圍
+        value = self._to_int32(value)
+        self._cells[addr] = value
+
+    def read(self, addr: int) -> int:
+        """讀取單一 cell。"""
+        if addr == NULL:
+            raise MemoryError("null pointer dereference", addr)
+        if addr not in self._cells:
+            raise MemoryError(f"read from unallocated address {addr}", addr)
+        return self._cells[addr]
+
+    def write_array(self, base_addr: int, values: list):
+        """批次寫入連續 cell。"""
+        for i, v in enumerate(values):
+            self.write(base_addr + i, v)
+
+    def read_array(self, base_addr: int, size: int) -> list:
+        """批次讀取連續 cell。"""
+        return [self.read(base_addr + i) for i in range(size)]
+
+    # ──────────────────────────────────────────
+    # 字串操作（char 陣列）
+    # ──────────────────────────────────────────
+
+    def write_string(self, addr: int, s: str):
+        """將 Python str 寫入記憶體（含結尾 \\0）。
+        呼叫者須確保已分配足夠空間。"""
+        for i, ch in enumerate(s):
+            self.write(addr + i, ord(ch))
+        self.write(addr + len(s), 0)   # null terminator
+
+    def read_string(self, addr: int) -> str:
+        """從位址讀取 null-terminated 字串，回傳 Python str。"""
+        if addr == NULL:
+            raise MemoryError("null pointer dereference (read_string)", addr)
+        chars = []
+        offset = 0
+        while True:
+            if addr + offset not in self._cells:
+                raise MemoryError(
+                    f"read_string: unallocated address {addr + offset}", addr)
+            c = self._cells[addr + offset]
+            if c == 0:
+                break
+            chars.append(chr(c & 0xFF))
+            offset += 1
+            if offset > 65536:
+                raise MemoryError("read_string: string too long (missing \\0?)", addr)
+        return ''.join(chars)
+
+    def strlen(self, addr: int) -> int:
+        """計算 null-terminated 字串長度（不含 \\0）。"""
+        return len(self.read_string(addr))
+
+    def strcpy(self, dest: int, src: int):
+        """將 src 位址的字串複製到 dest（含 \\0）。"""
+        s = self.read_string(src)
+        self.write_string(dest, s)
+
+    def strcat(self, dest: int, src: int):
+        """將 src 的字串串接到 dest 末尾。"""
+        dest_str = self.read_string(dest)
+        src_str  = self.read_string(src)
+        self.write_string(dest + len(dest_str), src_str)
+
+    def strcmp(self, s1_addr: int, s2_addr: int) -> int:
+        """比較兩字串，回傳負/零/正整數。"""
+        s1 = self.read_string(s1_addr)
+        s2 = self.read_string(s2_addr)
+        if s1 < s2: return -1
+        if s1 > s2: return  1
+        return 0
+
+    def memset(self, addr: int, value: int, size: int):
+        """將 addr 開始的 size 個 cell 全設為 value。"""
+        for i in range(size):
+            self.write(addr + i, value & 0xFF)
+
+    # ──────────────────────────────────────────
+    # 字串常數分配（唯讀區）
+    # ──────────────────────────────────────────
+
+    def alloc_string_literal(self, s: str) -> int:
+        """分配並寫入一個字串常數，回傳位址。"""
+        addr = self.alloc(len(s) + 1)
+        self.write_string(addr, s)
+        return addr
+
+    # ──────────────────────────────────────────
+    # 工具
+    # ──────────────────────────────────────────
+
+    @staticmethod
+    def _to_int32(v: int) -> int:
+        """截斷到 32-bit 有號整數。"""
+        v = v & 0xFFFFFFFF
+        if v >= 0x80000000:
+            v -= 0x100000000
+        return v
+
+    @staticmethod
+    def to_int32(v: int) -> int:
+        return Memory._to_int32(v)
+
+    @staticmethod
+    def _to_int8(v: int) -> int:
+        """截斷到 8-bit 有號整數（char）。"""
+        v = v & 0xFF
+        if v >= 0x80:
+            v -= 0x100
+        return v
+
+    @staticmethod
+    def to_int8(v: int) -> int:
+        return Memory._to_int8(v)
+
+    def is_allocated(self, addr: int) -> bool:
+        return addr in self._cells
+
+    def dump(self, start: int, end: int) -> str:
+        """除錯用：印出 [start, end) 的記憶體內容。"""
+        lines = []
+        for a in range(start, end):
+            v = self._cells.get(a, '?')
+            lines.append(f"  [{a:4d}] = {v}")
+        return '\n'.join(lines)
+</file>
+
+<file path="parser.py">
+"""
+Small-C Parser
+遞迴下降解析器，將 token 串建成 AST（抽象語法樹）。
+
+運算子優先順序（低 → 高）：
+  13: = += -= *= /= %=   (右結合)
+  12: ||
+  11: &&
+  10: |
+   9: ^
+   8: &
+   7: == !=
+   6: < <= > >=
+   5: << >>
+   4: + -
+   3: * / %
+   2: 前綴一元 - ! ~ * &  (右結合)
+   1: 後綴 () [] (最高)
+"""
+
+from lexer import TokenType as T, Token
+
+# ─────────────────────────── AST 節點 ───────────────────────────
+
+class Node:
+    """所有 AST 節點的基底類別"""
+    pass
+
+# ── 表達式 ──
+class IntLit(Node):
+    def __init__(self, value, line=0):
+        self.value = value
+        self.line  = line
+
+class CharLit(Node):
+    def __init__(self, value, line=0):
+        self.value = value   # int (ASCII)
+        self.line  = line
+
+class StrLit(Node):
+    def __init__(self, value, line=0):
+        self.value = value   # Python str
+        self.line  = line
+
+class Ident(Node):
+    def __init__(self, name, line=0):
+        self.name = name
+        self.line = line
+
+class BinOp(Node):
+    def __init__(self, op, left, right, line=0):
+        self.op    = op
+        self.left  = left
+        self.right = right
+        self.line  = line
+
+class UnaryOp(Node):
+    def __init__(self, op, operand, line=0):
+        self.op      = op
+        self.operand = operand
+        self.line    = line
+
+class Assign(Node):
+    def __init__(self, target, value, op='=', line=0):
+        self.target = target
+        self.value  = value
+        self.op     = op      # '=' '+=' '-=' '*=' '/=' '%='
+        self.line   = line
+
+class ArrayIndex(Node):
+    def __init__(self, array, index, line=0):
+        self.array = array
+        self.index = index
+        self.line  = line
+
+class FuncCall(Node):
+    def __init__(self, name, args, line=0):
+        self.name = name
+        self.args = args
+        self.line = line
+
+# ── 陳述句 ──
+class ExprStmt(Node):
+    def __init__(self, expr, line=0):
+        self.expr = expr
+        self.line = line
+
+class VarDecl(Node):
+    def __init__(self, dtype, name, init=None, size=None, is_ptr=False, line=0):
+        self.dtype  = dtype    # 'int' | 'char'
+        self.name   = name
+        self.init   = init     # 初始值表達式 (optional)
+        self.size   = size     # 陣列大小 (optional)
+        self.is_ptr = is_ptr   # 是否為指標
+        self.line   = line
+
+class Block(Node):
+    def __init__(self, stmts, line=0):
+        self.stmts = stmts
+        self.line  = line
+
+class IfStmt(Node):
+    def __init__(self, cond, then_branch, else_branch=None, line=0):
+        self.cond        = cond
+        self.then_branch = then_branch
+        self.else_branch = else_branch
+        self.line        = line
+
+class WhileStmt(Node):
+    def __init__(self, cond, body, line=0):
+        self.cond = cond
+        self.body = body
+        self.line = line
+
+class ForStmt(Node):
+    def __init__(self, init, cond, update, body, line=0):
+        self.init   = init
+        self.cond   = cond
+        self.update = update
+        self.body   = body
+        self.line   = line
+
+class DoWhileStmt(Node):
+    def __init__(self, body, cond, line=0):
+        self.body = body
+        self.cond = cond
+        self.line = line
+
+class BreakStmt(Node):
+    def __init__(self, line=0): self.line = line
+
+class ContinueStmt(Node):
+    def __init__(self, line=0): self.line = line
+
+class ReturnStmt(Node):
+    def __init__(self, value=None, line=0):
+        self.value = value
+        self.line  = line
+
+# ── 頂層 ──
+class FuncDef(Node):
+    def __init__(self, rtype, name, params, body, line=0):
+        self.rtype  = rtype    # 'int' | 'char' | 'void'
+        self.name   = name
+        self.params = params   # list of (dtype, is_ptr, name)
+        self.body   = body     # Block
+        self.line   = line
+
+class Define(Node):
+    def __init__(self, name, value_str, line=0):
+        self.name      = name
+        self.value_str = value_str
+        self.line      = line
+
+class Program(Node):
+    def __init__(self, decls):
+        self.decls = decls   # list of FuncDef | VarDecl | Define
+
+
+# ─────────────────────────── 例外 ───────────────────────────
+
+class ParseError(Exception):
+    def __init__(self, msg, line=0):
+        super().__init__(msg)
+        self.line = line
+
+
+# ─────────────────────────── Parser ───────────────────────────
+
+class Parser:
+    def __init__(self, tokens, defines=None):
+        self.tokens  = tokens
+        self.pos     = 0
+        self.defines = defines or {}   # name → int 值（前處理結果）
+
+    # ── 工具方法 ──
+
+    def peek(self, offset=0):
+        idx = self.pos + offset
+        return self.tokens[idx] if idx < len(self.tokens) else self.tokens[-1]
+
+    def advance(self):
+        tok = self.tokens[self.pos]
+        if self.pos < len(self.tokens) - 1:
+            self.pos += 1
+        return tok
+
+    def check(self, *types):
+        return self.peek().type in types
+
+    def match(self, *types):
+        if self.check(*types):
+            return self.advance()
+        return None
+
+    def expect(self, ttype, msg=None):
+        tok = self.peek()
+        if tok.type != ttype:
+            raise ParseError(
+                msg or f"expected {ttype.name}, got {tok.type.name} ({tok.value!r})",
+                tok.line
+            )
+        return self.advance()
+
+    def current_line(self):
+        return self.peek().line
+
+    # ── 型別解析輔助 ──
+
+    def _is_type(self):
+        return self.check(T.INT, T.CHAR, T.VOID)
+
+    def _parse_type(self):
+        tok = self.advance()
+        return tok.value   # 'int' | 'char' | 'void'
+
+    # ─────────────────────────── 頂層 ───────────────────────────
+
+    def parse_program(self):
+        decls = []
+        while not self.check(T.EOF):
+            decls.extend(self._parse_top_level())
+        return Program(decls)
+
+    def _parse_top_level(self):
+        """解析一個頂層宣告（函式定義或全域變數宣告或 #define）"""
+        tok = self.peek()
+
+        # #define
+        if tok.type == T.DEFINE:
+            self.advance()
+            name, val_str = tok.value
+            # 嘗試將 val_str 解析為整數
+            val = self._eval_define_value(val_str)
+            self.defines[name] = val
+            return [Define(name, val_str, tok.line)]
+
+        # 型別開頭 → 可能是函式或全域變數
+        if self._is_type():
+            return [self._parse_func_or_global_var()]
+
+        raise ParseError(
+            f"unexpected token at top level: {tok.type.name} ({tok.value!r})",
+            tok.line
+        )
+
+    def _eval_define_value(self, s):
+        """把 #define 的值字串轉成整數（支援十六進位）"""
+        s = s.strip()
+        try:
+            if s.startswith('0x') or s.startswith('0X'):
+                return int(s, 16)
+            return int(s)
+        except ValueError:
+            return 0
+
+    def _parse_func_or_global_var(self):
+        line = self.current_line()
+        rtype = self._parse_type()
+
+        # 指標回傳型別 void * / int *（不常用，但允許）
+        is_ret_ptr = bool(self.match(T.STAR))
+
+        name_tok = self.expect(T.IDENT)
+        name = name_tok.value
+
+        # 如果下一個是 '('，就是函式定義
+        if self.check(T.LPAREN):
+            return self._parse_func_def(rtype, name, line)
+
+        # 否則是全域變數宣告
+        return self._parse_var_decl_tail(rtype, name, is_ret_ptr, line)
+
+    def _parse_func_def(self, rtype, name, line):
+        self.expect(T.LPAREN)
+        params = []
+        if not self.check(T.RPAREN):
+            params = self._parse_param_list()
+        self.expect(T.RPAREN)
+        body = self._parse_block()
+        return FuncDef(rtype, name, params, body, line)
+
+    def _parse_param_list(self):
+        params = []
+        while True:
+            dtype = self._parse_type()
+            is_ptr = bool(self.match(T.STAR))
+            pname = self.expect(T.IDENT).value
+            params.append((dtype, is_ptr, pname))
+            if not self.match(T.COMMA):
+                break
+        return params
+
+    # ─────────────────────────── 陳述句 ───────────────────────────
+
+    def _parse_block(self):
+        line = self.current_line()
+        self.expect(T.LBRACE)
+        stmts = []
+        while not self.check(T.RBRACE) and not self.check(T.EOF):
+            stmts.append(self._parse_stmt())
+        self.expect(T.RBRACE)
+        return Block(stmts, line)
+
+    def _parse_stmt(self):
+        tok = self.peek()
+
+        if tok.type == T.LBRACE:
+            return self._parse_block()
+
+        if tok.type == T.IF:
+            return self._parse_if()
+
+        if tok.type == T.WHILE:
+            return self._parse_while()
+
+        if tok.type == T.FOR:
+            return self._parse_for()
+
+        if tok.type == T.DO:
+            return self._parse_do_while()
+
+        if tok.type == T.BREAK:
+            self.advance()
+            self.expect(T.SEMICOLON)
+            return BreakStmt(tok.line)
+
+        if tok.type == T.CONTINUE:
+            self.advance()
+            self.expect(T.SEMICOLON)
+            return ContinueStmt(tok.line)
+
+        if tok.type == T.RETURN:
+            return self._parse_return()
+
+        if tok.type == T.DEFINE:
+            self.advance()
+            name, val_str = tok.value
+            val = self._eval_define_value(val_str)
+            self.defines[name] = val
+            return Define(name, val_str, tok.line)
+
+        # 變數宣告：int / char 開頭
+        if tok.type in (T.INT, T.CHAR):
+            return self._parse_local_var_decl()
+
+        # void 開頭（幾乎不會在陳述句出現，但防禦一下）
+        if tok.type == T.VOID:
+            raise ParseError("void 不可作為區域變數型別", tok.line)
+
+        # 表達式陳述句
+        expr = self._parse_expr()
+        self.expect(T.SEMICOLON, f"expected ';' after expression statement")
+        return ExprStmt(expr, tok.line)
+
+    def _parse_local_var_decl(self):
+        line = self.current_line()
+        dtype = self._parse_type()   # 'int' or 'char'
+        is_ptr = bool(self.match(T.STAR))
+        name = self.expect(T.IDENT).value
+        return self._parse_var_decl_tail(dtype, name, is_ptr, line)
+
+    def _parse_var_decl_tail(self, dtype, name, is_ptr, line):
+        """解析變數宣告的尾端：可能是陣列、初始值或直接分號"""
+        # 陣列 int arr[N];
+        if self.match(T.LBRACKET):
+            size_expr = self._parse_expr()
+            self.expect(T.RBRACKET)
+            self.expect(T.SEMICOLON)
+            return VarDecl(dtype, name, size=size_expr, line=line)
+
+        # 有初始值
+        init = None
+        if self.match(T.ASSIGN):
+            init = self._parse_expr()
+
+        self.expect(T.SEMICOLON)
+        return VarDecl(dtype, name, init=init, is_ptr=is_ptr, line=line)
+
+    def _parse_if(self):
+        line = self.current_line()
+        self.expect(T.IF)
+        self.expect(T.LPAREN)
+        cond = self._parse_expr()
+        self.expect(T.RPAREN)
+        then_branch = self._parse_stmt()
+        else_branch = None
+        if self.match(T.ELSE):
+            else_branch = self._parse_stmt()
+        return IfStmt(cond, then_branch, else_branch, line)
+
+    def _parse_while(self):
+        line = self.current_line()
+        self.expect(T.WHILE)
+        self.expect(T.LPAREN)
+        cond = self._parse_expr()
+        self.expect(T.RPAREN)
+        body = self._parse_stmt()
+        return WhileStmt(cond, body, line)
+
+    def _parse_for(self):
+        line = self.current_line()
+        self.expect(T.FOR)
+        self.expect(T.LPAREN)
+
+        # init：可以是變數宣告或表達式
+        init = None
+        if not self.check(T.SEMICOLON):
+            if self.check(T.INT, T.CHAR):
+                init = self._parse_local_var_decl()  # 已含分號
+            else:
+                init = ExprStmt(self._parse_expr(), line)
+                self.expect(T.SEMICOLON)
+        else:
+            self.expect(T.SEMICOLON)
+
+        # cond
+        cond = None
+        if not self.check(T.SEMICOLON):
+            cond = self._parse_expr()
+        self.expect(T.SEMICOLON)
+
+        # update
+        update = None
+        if not self.check(T.RPAREN):
+            update = self._parse_expr()
+        self.expect(T.RPAREN)
+
+        body = self._parse_stmt()
+        return ForStmt(init, cond, update, body, line)
+
+    def _parse_do_while(self):
+        line = self.current_line()
+        self.expect(T.DO)
+        body = self._parse_stmt()
+        self.expect(T.WHILE)
+        self.expect(T.LPAREN)
+        cond = self._parse_expr()
+        self.expect(T.RPAREN)
+        self.expect(T.SEMICOLON)
+        return DoWhileStmt(body, cond, line)
+
+    def _parse_return(self):
+        line = self.current_line()
+        self.expect(T.RETURN)
+        value = None
+        if not self.check(T.SEMICOLON):
+            value = self._parse_expr()
+        self.expect(T.SEMICOLON)
+        return ReturnStmt(value, line)
+
+    # ─────────────────────────── 表達式（優先序爬升） ───────────────────────────
+
+    def _parse_expr(self):
+        return self._parse_assign()
+
+    def _parse_assign(self):
+        """優先序 13（最低，右結合）：= += -= *= /= %="""
+        left = self._parse_or()
+        line = self.current_line()
+
+        assign_ops = {
+            T.ASSIGN:     '=',
+            T.PLUS_EQ:    '+=',
+            T.MINUS_EQ:   '-=',
+            T.STAR_EQ:    '*=',
+            T.SLASH_EQ:   '/=',
+            T.PERCENT_EQ: '%=',
+        }
+        tok = self.peek()
+        if tok.type in assign_ops:
+            op = assign_ops[tok.type]
+            self.advance()
+            right = self._parse_assign()   # 右結合
+            return Assign(left, right, op, line)
+        return left
+
+    def _parse_or(self):
+        """優先序 12：||"""
+        left = self._parse_and()
+        while self.check(T.OR):
+            op = self.advance().value
+            right = self._parse_and()
+            left = BinOp(op, left, right, left.line)
+        return left
+
+    def _parse_and(self):
+        """優先序 11：&&"""
+        left = self._parse_bitor()
+        while self.check(T.AND):
+            op = self.advance().value
+            right = self._parse_bitor()
+            left = BinOp(op, left, right, left.line)
+        return left
+
+    def _parse_bitor(self):
+        """優先序 10：|"""
+        left = self._parse_bitxor()
+        while self.check(T.PIPE):
+            op = self.advance().value
+            right = self._parse_bitxor()
+            left = BinOp(op, left, right, left.line)
+        return left
+
+    def _parse_bitxor(self):
+        """優先序 9：^"""
+        left = self._parse_bitand()
+        while self.check(T.CARET):
+            op = self.advance().value
+            right = self._parse_bitand()
+            left = BinOp(op, left, right, left.line)
+        return left
+
+    def _parse_bitand(self):
+        """優先序 8：&"""
+        left = self._parse_equality()
+        while self.check(T.AMP):
+            op = self.advance().value
+            right = self._parse_equality()
+            left = BinOp(op, left, right, left.line)
+        return left
+
+    def _parse_equality(self):
+        """優先序 7：== !="""
+        left = self._parse_relational()
+        while self.check(T.EQ, T.NEQ):
+            op = self.advance().value
+            right = self._parse_relational()
+            left = BinOp(op, left, right, left.line)
+        return left
+
+    def _parse_relational(self):
+        """優先序 6：< <= > >="""
+        left = self._parse_shift()
+        while self.check(T.LT, T.LE, T.GT, T.GE):
+            op = self.advance().value
+            right = self._parse_shift()
+            left = BinOp(op, left, right, left.line)
+        return left
+
+    def _parse_shift(self):
+        """優先序 5：<< >>"""
+        left = self._parse_additive()
+        while self.check(T.LSHIFT, T.RSHIFT):
+            op = self.advance().value
+            right = self._parse_additive()
+            left = BinOp(op, left, right, left.line)
+        return left
+
+    def _parse_additive(self):
+        """優先序 4：+ -"""
+        left = self._parse_multiplicative()
+        while self.check(T.PLUS, T.MINUS):
+            op = self.advance().value
+            right = self._parse_multiplicative()
+            left = BinOp(op, left, right, left.line)
+        return left
+
+    def _parse_multiplicative(self):
+        """優先序 3：* / %"""
+        left = self._parse_unary()
+        while self.check(T.STAR, T.SLASH, T.PERCENT):
+            op = self.advance().value
+            right = self._parse_unary()
+            left = BinOp(op, left, right, left.line)
+        return left
+
+    def _parse_unary(self):
+        """優先序 2：前綴一元（右結合）"""
+        tok = self.peek()
+        line = tok.line
+
+        if tok.type == T.MINUS:
+            self.advance()
+            return UnaryOp('-', self._parse_unary(), line)
+
+        if tok.type == T.BANG:
+            self.advance()
+            return UnaryOp('!', self._parse_unary(), line)
+
+        if tok.type == T.TILDE:
+            self.advance()
+            return UnaryOp('~', self._parse_unary(), line)
+
+        if tok.type == T.STAR:
+            self.advance()
+            return UnaryOp('*', self._parse_unary(), line)   # 取值
+
+        if tok.type == T.AMP:
+            self.advance()
+            return UnaryOp('&', self._parse_unary(), line)   # 取址
+
+        if tok.type == T.INC:
+            self.advance()
+            return UnaryOp('++pre', self._parse_unary(), line)
+
+        if tok.type == T.DEC:
+            self.advance()
+            return UnaryOp('--pre', self._parse_unary(), line)
+
+        return self._parse_postfix()
+
+    def _parse_postfix(self):
+        """優先序 1：後綴（函式呼叫、陣列索引）"""
+        node = self._parse_primary()
+        while True:
+            line = self.current_line()
+            if self.match(T.LBRACKET):
+                idx = self._parse_expr()
+                self.expect(T.RBRACKET)
+                node = ArrayIndex(node, idx, line)
+            elif self.check(T.LPAREN):
+                # 函式呼叫（primary 已處理識別字函式呼叫）
+                # 這裡處理函式指標呼叫等邊緣情況
+                break
+            else:
+                break
+        return node
+
+    def _parse_primary(self):
+        """最高優先序：字面值、識別字、括號、函式呼叫"""
+        tok = self.peek()
+        line = tok.line
+
+        # 整數字面值
+        if tok.type == T.INT_LIT:
+            self.advance()
+            return IntLit(tok.value, line)
+
+        # 字元字面值
+        if tok.type == T.CHAR_LIT:
+            self.advance()
+            return CharLit(tok.value, line)
+
+        # 字串字面值
+        if tok.type == T.STR_LIT:
+            self.advance()
+            return StrLit(tok.value, line)
+
+        # 識別字：可能是變數、#define 常數、或函式呼叫
+        if tok.type == T.IDENT:
+            self.advance()
+            name = tok.value
+
+            # 函式呼叫
+            if self.check(T.LPAREN):
+                self.advance()
+                args = []
+                if not self.check(T.RPAREN):
+                    args.append(self._parse_expr())
+                    while self.match(T.COMMA):
+                        args.append(self._parse_expr())
+                self.expect(T.RPAREN)
+                return FuncCall(name, args, line)
+
+            # #define 常數展開
+            if name in self.defines:
+                return IntLit(self.defines[name], line)
+
+            return Ident(name, line)
+
+        # 括號表達式
+        if tok.type == T.LPAREN:
+            self.advance()
+            expr = self._parse_expr()
+            self.expect(T.RPAREN)
+            return expr
+
+        raise ParseError(
+            f"unexpected token in expression: {tok.type.name} ({tok.value!r})",
+            tok.line
+        )
+
+
+# ─────────────────────────── 公開介面 ───────────────────────────
+
+def parse(tokens, defines=None):
+    """解析完整程式，回傳 Program 節點"""
+    p = Parser(tokens, defines)
+    return p.parse_program()
+
+def parse_stmts(tokens, defines=None):
+    """解析一系列陳述句（互動模式用）"""
+    p = Parser(tokens, defines)
+    stmts = []
+    while not p.check(T.EOF):
+        stmts.append(p._parse_stmt())
+    return stmts
+
+def parse_expr(tokens, defines=None):
+    """解析單一表達式（測試用）"""
+    p = Parser(tokens, defines)
+    return p._parse_expr()
+</file>
+
+<file path="repl.py">
+"""
+Small-C REPL
+互動式解譯器環境，實作所有環境指令。
+"""
+
+import os
+import sys
+from interpreter import Interpreter, RuntimeError_
+from smallc_builtins import ExitCalled
+
+
+class Repl:
+    def __init__(self):
+        self.buffer    : list[str] = []   # 程式緩衝區（行列表）
+        self.modified  : bool = False     # 是否有未儲存修改
+        self.interp    = Interpreter()
+        self.trace_on  : bool = False
+        self.last_file : str  = ''        # 上次 SAVE/LOAD 的檔名
+
+    # ─────────────────── 主迴圈 ───────────────────
+
+    def run(self):
+        self._print_welcome()
+        while True:
+            try:
+                raw = input("sc> ")
+            except (EOFError, KeyboardInterrupt):
+                print()
+                self._do_quit()
+                return
+
+            line = raw.strip()
+            if not line:
+                continue
+
+            upper = line.upper()
+            cmd   = upper.split()[0]
+
+            try:
+                if   cmd in ('QUIT', 'EXIT'):   self._do_quit(); return
+                elif cmd == 'ABOUT':             self._do_about()
+                elif cmd == 'HELP':              self._do_help(line)
+                elif cmd == 'NEW':               self._do_new()
+                elif cmd == 'APPEND':            self._do_append()
+                elif cmd == 'LIST':              self._do_list(line)
+                elif cmd == 'EDIT':              self._do_edit(line)
+                elif cmd == 'DELETE':            self._do_delete(line)
+                elif cmd == 'INSERT':            self._do_insert(line)
+                elif cmd == 'SAVE':              self._do_save(line)
+                elif cmd == 'LOAD':              self._do_load(line)
+                elif cmd == 'RUN':               self._do_run()
+                elif cmd == 'CHECK':             self._do_check()
+                elif cmd == 'TRACE':             self._do_trace(line)
+                elif cmd == 'VARS':              self._do_vars()
+                elif cmd == 'FUNCS':             self._do_funcs()
+                elif cmd == 'CLEAR':             self._do_clear()
+                else:
+                    # 當成程式碼執行（互動模式）
+                    self._exec_interactive(raw)
+            except SystemExit:
+                return
+            except Exception as e:
+                print(f"Error: {e}")
+
+    # ─────────────────── 互動模式程式碼執行 ───────────────────
+
+    def _exec_interactive(self, first_line: str):
+        """
+        執行互動模式輸入。
+        若輸入是多行結構（if/while/for/do/函式定義），
+        持續讀取直到大括號平衡。
+        """
+        source = self._read_multiline(first_line)
+        try:
+            self.interp.exec_interactive(source)
+        except RuntimeError_ as e:
+            print(e)
+        except ExitCalled as e:
+            print(f"Program exited with return value {e.code}.")
+
+    def _read_multiline(self, first_line: str) -> str:
+        """若大括號未平衡，持續讀取後續行。"""
+        lines  = [first_line]
+        depth  = first_line.count('{') - first_line.count('}')
+        indent = 1
+
+        while depth > 0:
+            try:
+                cont = input(f"{'  ' * indent}> ")
+            except (EOFError, KeyboardInterrupt):
+                break
+            lines.append(cont)
+            depth += cont.count('{') - cont.count('}')
+            if depth > 0:
+                indent += 1
+            else:
+                indent = max(1, indent - 1)
+
+        return '\n'.join(lines)
+
+    # ─────────────────── 環境指令 ───────────────────
+
+    def _do_about(self):
+        print("=" * 44)
+        print("  Small-C Interactive Interpreter v1.0")
+        print("  System Software Final Project, Spring 2026")
+        print("=" * 44)
+
+    def _do_help(self, line):
+        parts = line.split()
+        if len(parts) >= 2:
+            self._do_help_cmd(parts[1].upper())
+            return
+        print("""Available commands:
+  ABOUT               Show interpreter info
+  HELP [cmd]          Show help (or help for cmd)
+  NEW                 Clear program buffer and reset state
+  APPEND              Enter append mode (add lines to end)
+  LIST [n|n1-n2]      List program buffer
+  EDIT <n>            Edit line n
+  DELETE <n|n1-n2>    Delete line(s)
+  INSERT <n>          Insert lines before line n
+  SAVE <filename>     Save buffer to file
+  LOAD <filename>     Load file into buffer
+  RUN                 Execute the program
+  CHECK               Check syntax without running
+  TRACE ON|OFF        Toggle execution trace
+  VARS                Show all variables
+  FUNCS               Show all functions
+  CLEAR               Clear the screen
+  QUIT / EXIT         Exit the interpreter""")
+
+    def _do_help_cmd(self, cmd):
+        helps = {
+            'LOAD':   'LOAD <filename>  — Load a Small-C source file into the buffer.',
+            'SAVE':   'SAVE <filename>  — Save the current buffer to a file.',
+            'LIST':   'LIST [n|n1-n2]   — List all lines, line n, or range n1-n2.',
+            'EDIT':   'EDIT <n>         — Edit line n interactively.',
+            'DELETE': 'DELETE <n|n1-n2> — Delete line n or range n1-n2.',
+            'INSERT': 'INSERT <n>       — Insert new lines before line n.',
+            'APPEND': 'APPEND           — Append lines at the end of the buffer.',
+            'NEW':    'NEW              — Clear buffer and reset all state.',
+            'RUN':    'RUN              — Run the current program.',
+            'CHECK':  'CHECK            — Check syntax without running.',
+            'TRACE':  'TRACE ON|OFF     — Enable/disable execution trace.',
+            'VARS':   'VARS             — Display all current variables.',
+            'FUNCS':  'FUNCS            — Display all defined functions.',
+            'CLEAR':  'CLEAR            — Clear the terminal screen.',
+            'ABOUT':  'ABOUT            — Show interpreter name, version, author, semester.',
+        }
+        msg = helps.get(cmd, f"No help available for '{cmd}'.")
+        print(msg)
+
+    def _do_new(self):
+        if self.modified and self.buffer:
+            ans = input("Unsaved changes. Discard? [y/N] ").strip().lower()
+            if ans != 'y':
+                print("Cancelled.")
+                return
+        self.buffer   = []
+        self.modified = False
+        self.interp.reset()
+        print("All cleared.")
+
+    def _do_append(self):
+        """進入 APPEND 模式，讀取到獨立的 '.' 為止。"""
+        n = len(self.buffer) + 1
+        while True:
+            try:
+                raw = input(f"{n:4d}> ")
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            if raw.strip() == '.':
+                break
+            self.buffer.append(raw)
+            self.modified = True
+            n += 1
+
+    def _do_list(self, line):
+        parts = line.split()
+        if not self.buffer:
+            print("(buffer is empty)")
+            return
+
+        if len(parts) == 1:
+            # LIST 全部
+            for i, ln in enumerate(self.buffer, 1):
+                print(f"{i:4d}: {ln}")
+            return
+
+        arg = parts[1]
+        if '-' in arg:
+            # LIST n1-n2
+            try:
+                n1, n2 = arg.split('-')
+                n1, n2 = int(n1), int(n2)
+            except ValueError:
+                print("Usage: LIST n1-n2")
+                return
+            for i in range(n1, min(n2 + 1, len(self.buffer) + 1)):
+                print(f"{i:4d}: {self.buffer[i-1]}")
+        else:
+            # LIST n
+            try:
+                n = int(arg)
+            except ValueError:
+                print("Usage: LIST <n>")
+                return
+            if 1 <= n <= len(self.buffer):
+                print(f"{n:4d}: {self.buffer[n-1]}")
+            else:
+                print(f"Line {n} out of range (1-{len(self.buffer)}).")
+
+    def _do_edit(self, line):
+        parts = line.split()
+        if len(parts) < 2:
+            print("Usage: EDIT <n>")
+            return
+        try:
+            n = int(parts[1])
+        except ValueError:
+            print("Usage: EDIT <n>")
+            return
+        if not (1 <= n <= len(self.buffer)):
+            print(f"Line {n} out of range.")
+            return
+        print(f"{n:4d}: {self.buffer[n-1]}")
+        try:
+            new_line = input(f"{n:4d}: ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if new_line != '':   # Enter 保留原行
+            self.buffer[n-1] = new_line
+            self.modified = True
+
+    def _do_delete(self, line):
+        parts = line.split()
+        if len(parts) < 2:
+            print("Usage: DELETE <n|n1-n2>")
+            return
+        arg = parts[1]
+        if '-' in arg:
+            try:
+                n1, n2 = arg.split('-')
+                n1, n2 = int(n1), int(n2)
+            except ValueError:
+                print("Usage: DELETE n1-n2")
+                return
+            n1 = max(1, n1)
+            n2 = min(len(self.buffer), n2)
+            del self.buffer[n1-1:n2]
+            self.modified = True
+            print(f"Deleted lines {n1}-{n2}.")
+        else:
+            try:
+                n = int(arg)
+            except ValueError:
+                print("Usage: DELETE <n>")
+                return
+            if not (1 <= n <= len(self.buffer)):
+                print(f"Line {n} out of range.")
+                return
+            del self.buffer[n-1]
+            self.modified = True
+            print(f"Deleted line {n}.")
+
+    def _do_insert(self, line):
+        parts = line.split()
+        if len(parts) < 2:
+            print("Usage: INSERT <n>")
+            return
+        try:
+            n = int(parts[1])
+        except ValueError:
+            print("Usage: INSERT <n>")
+            return
+        if not (1 <= n <= len(self.buffer) + 1):
+            print(f"Line {n} out of range.")
+            return
+
+        new_lines = []
+        cur = n
+        while True:
+            try:
+                raw = input(f"{cur:4d}> ")
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            if raw.strip() == '.':
+                break
+            new_lines.append(raw)
+            cur += 1
+
+        self.buffer[n-1:n-1] = new_lines
+        self.modified = True
+        print(f"Inserted {len(new_lines)} line(s) before line {n}.")
+
+    def _do_save(self, line):
+        parts = line.split()
+        if len(parts) < 2:
+            if self.last_file:
+                filename = self.last_file
+            else:
+                print("Usage: SAVE <filename>")
+                return
+        else:
+            filename = parts[1]
+        try:
+            with open(filename, 'w', encoding='utf-8') as f:
+                for ln in self.buffer:
+                    f.write(ln + '\n')
+            self.modified  = False
+            self.last_file = filename
+            print(f"Saved {len(self.buffer)} lines to '{filename}'.")
+        except IOError as e:
+            print(f"Error saving '{filename}': {e}")
+
+    def _do_load(self, line):
+        parts = line.split()
+        if len(parts) < 2:
+            print("Usage: LOAD <filename>")
+            return
+        filename = parts[1]
+        if self.modified and self.buffer:
+            ans = input("Unsaved changes. Discard? [y/N] ").strip().lower()
+            if ans != 'y':
+                print("Cancelled.")
+                return
+        try:
+            with open(filename, 'r', encoding='utf-8') as f:
+                lines = f.read().splitlines()
+            self.buffer    = lines
+            self.modified  = False
+            self.last_file = filename
+            self.interp.reset()
+            print(f"Loaded {len(lines)} lines from '{filename}'.")
+        except FileNotFoundError:
+            print(f"Error: file '{filename}' not found.")
+        except IOError as e:
+            print(f"Error loading '{filename}': {e}")
+
+    def _do_run(self):
+        if not self.buffer:
+            print("Buffer is empty. Nothing to run.")
+            return
+        source = '\n'.join(self.buffer)
+        self.interp.trace = self.trace_on
+        try:
+            self.interp.run_program(source)
+        except RuntimeError_ as e:
+            line_info = f" (line {e.line})" if e.line else ""
+            print(f"{e}{line_info}")
+        except ExitCalled as e:
+            print(f"Program exited with return value {e.code}.")
+
+    def _do_check(self):
+        if not self.buffer:
+            print("Buffer is empty.")
+            return
+        source = '\n'.join(self.buffer)
+        errors = self.interp.check_syntax(source)
+        if errors:
+            for err in errors:
+                print(err)
+            print(f"{len(errors)} error(s) found.")
+        else:
+            print("No errors found.")
+
+    def _do_trace(self, line):
+        parts = line.upper().split()
+        if len(parts) < 2:
+            print("Usage: TRACE ON|OFF")
+            return
+        if parts[1] == 'ON':
+            self.trace_on = True
+            self.interp.trace = True
+            print("Trace mode enabled.")
+        elif parts[1] == 'OFF':
+            self.trace_on = False
+            self.interp.trace = False
+            print("Trace mode disabled.")
+        else:
+            print("Usage: TRACE ON|OFF")
+
+    def _do_vars(self):
+        print(self.interp.dump_vars())
+
+    def _do_funcs(self):
+        print(self.interp.dump_funcs())
+
+    def _do_clear(self):
+        os.system('cls' if os.name == 'nt' else 'clear')
+
+    def _do_quit(self):
+        if self.modified and self.buffer:
+            try:
+                ans = input("Unsaved changes. Discard and quit? [y/N] ").strip().lower()
+                if ans != 'y':
+                    print("Cancelled.")
+                    return
+            except (EOFError, KeyboardInterrupt):
+                print()
+        print("Goodbye.")
+
+    def _print_welcome(self):
+        print("=" * 44)
+        print("  Small-C Interactive Interpreter v1.0")
+        print("  System Software Final Project, Spring 2026")
+        print("=" * 44)
+        print("Type `HELP` for a list of commands.")
+        print()
+</file>
+
+<file path="smallc_builtins.py">
+"""
+Small-C Built-in Functions
+實作所有內建函式，並提供登記到 SymbolTable 的介面。
+
+分類：
+  I/O      : printf, puts, putchar, getchar, scanf
+  字串     : strlen, strcpy, strcat, strcmp
+  數學     : abs, max, min, pow, sqrt, mod, rand, srand
+  工具     : memset, sizeof_int, sizeof_char, atoi, itoa, exit
+"""
+
+import math
+import random
+import sys
+
+from memory import Memory, MemoryError
+from symtable import SymbolTable, FuncEntry
+
+
+# ──────────────────────────────────────────
+# 例外：exit() 呼叫
+# ──────────────────────────────────────────
+
+class ExitCalled(Exception):
+    def __init__(self, code=0):
+        super().__init__(f"exit({code})")
+        self.code = code
+
+
+class BuiltinError(Exception):
+    def __init__(self, msg, line=0):
+        super().__init__(msg)
+        self.line = line
+
+
+# ──────────────────────────────────────────
+# printf 格式化輸出（核心）
+# ──────────────────────────────────────────
+
+def _do_printf(fmt: str, args: list, mem: Memory) -> str:
+    """
+    解析 printf 格式字串，回傳輸出字串。
+    支援：%d %c %s %x %%
+    """
+    result = []
+    i = 0
+    arg_idx = 0
+
+    while i < len(fmt):
+        c = fmt[i]
+        if c != '%':
+            result.append(c)
+            i += 1
+            continue
+
+        i += 1
+        if i >= len(fmt):
+            break
+
+        spec = fmt[i]
+        i += 1
+
+        if spec == '%':
+            result.append('%')
+        elif spec == 'd':
+            if arg_idx >= len(args):
+                raise BuiltinError("printf: not enough arguments for %d")
+            val = args[arg_idx]; arg_idx += 1
+            result.append(str(int(val)))
+        elif spec == 'c':
+            if arg_idx >= len(args):
+                raise BuiltinError("printf: not enough arguments for %c")
+            val = args[arg_idx]; arg_idx += 1
+            result.append(chr(int(val) & 0xFF))
+        elif spec == 's':
+            if arg_idx >= len(args):
+                raise BuiltinError("printf: not enough arguments for %s")
+            addr = args[arg_idx]; arg_idx += 1
+            result.append(mem.read_string(int(addr)))
+        elif spec == 'x':
+            if arg_idx >= len(args):
+                raise BuiltinError("printf: not enough arguments for %x")
+            val = args[arg_idx]; arg_idx += 1
+            result.append(format(int(val) & 0xFFFFFFFF, 'x'))
+        else:
+            # 未知格式碼，原樣輸出
+            result.append('%')
+            result.append(spec)
+
+    return ''.join(result)
+
+
+# ──────────────────────────────────────────
+# scanf 格式化輸入
+# ──────────────────────────────────────────
+
+def _do_scanf(fmt: str, arg_addrs: list, mem: Memory,
+              input_fn=None) -> int:
+    """
+    解析 scanf 格式字串，從 stdin 讀取並寫入對應位址。
+    支援：%d %c
+    回傳成功讀取的項目數。
+    """
+    if input_fn is None:
+        input_fn = input
+
+    count = 0
+    i = 0
+    arg_idx = 0
+
+    while i < len(fmt) and arg_idx < len(arg_addrs):
+        c = fmt[i]
+        if c != '%':
+            i += 1
+            continue
+        i += 1
+        if i >= len(fmt):
+            break
+        spec = fmt[i]; i += 1
+
+        addr = arg_addrs[arg_idx]; arg_idx += 1
+
+        if spec == 'd':
+            try:
+                line = input_fn()
+                val = int(line.strip())
+                mem.write(int(addr), val)
+                count += 1
+            except (ValueError, EOFError):
+                break
+        elif spec == 'c':
+            try:
+                line = input_fn()
+                if line:
+                    mem.write(int(addr), ord(line[0]))
+                    count += 1
+            except EOFError:
+                break
+
+    return count
+
+
+# ──────────────────────────────────────────
+# 內建函式實作表
+# key   = 函式名稱
+# value = callable(args: list, mem: Memory, input_fn) → int|None
+# ──────────────────────────────────────────
+
+def _builtin_putchar(args, mem, input_fn):
+    if len(args) < 1:
+        raise BuiltinError("putchar: expected 1 argument")
+    ch = int(args[0]) & 0xFF
+    sys.stdout.write(chr(ch))
+    sys.stdout.flush()
+    return ch
+
+def _builtin_getchar(args, mem, input_fn):
+    try:
+        if input_fn:
+            line = input_fn()
+            return ord(line[0]) if line else -1
+        ch = sys.stdin.read(1)
+        return ord(ch) if ch else -1
+    except EOFError:
+        return -1
+
+def _builtin_printf(args, mem, input_fn):
+    if len(args) < 1:
+        raise BuiltinError("printf: expected at least 1 argument")
+    fmt_addr = int(args[0])
+    fmt_str  = mem.read_string(fmt_addr)
+    out = _do_printf(fmt_str, args[1:], mem)
+    sys.stdout.write(out)
+    sys.stdout.flush()
+    return 0
+
+def _builtin_puts(args, mem, input_fn):
+    if len(args) < 1:
+        raise BuiltinError("puts: expected 1 argument")
+    addr = int(args[0])
+    s = mem.read_string(addr)
+    print(s)   # puts 自動換行
+    return 0
+
+def _builtin_scanf(args, mem, input_fn):
+    if len(args) < 1:
+        raise BuiltinError("scanf: expected at least 1 argument")
+    fmt_addr  = int(args[0])
+    fmt_str   = mem.read_string(fmt_addr)
+    arg_addrs = args[1:]
+    return _do_scanf(fmt_str, arg_addrs, mem, input_fn)
+
+# 字串函式
+def _builtin_strlen(args, mem, input_fn):
+    if len(args) < 1:
+        raise BuiltinError("strlen: expected 1 argument")
+    return mem.strlen(int(args[0]))
+
+def _builtin_strcpy(args, mem, input_fn):
+    if len(args) < 2:
+        raise BuiltinError("strcpy: expected 2 arguments")
+    mem.strcpy(int(args[0]), int(args[1]))
+    return int(args[0])
+
+def _builtin_strcat(args, mem, input_fn):
+    if len(args) < 2:
+        raise BuiltinError("strcat: expected 2 arguments")
+    mem.strcat(int(args[0]), int(args[1]))
+    return int(args[0])
+
+def _builtin_strcmp(args, mem, input_fn):
+    if len(args) < 2:
+        raise BuiltinError("strcmp: expected 2 arguments")
+    return mem.strcmp(int(args[0]), int(args[1]))
+
+# 數學函式
+def _builtin_abs(args, mem, input_fn):
+    if len(args) < 1:
+        raise BuiltinError("abs: expected 1 argument")
+    return abs(int(args[0]))
+
+def _builtin_max(args, mem, input_fn):
+    if len(args) < 2:
+        raise BuiltinError("max: expected 2 arguments")
+    return max(int(args[0]), int(args[1]))
+
+def _builtin_min(args, mem, input_fn):
+    if len(args) < 2:
+        raise BuiltinError("min: expected 2 arguments")
+    return min(int(args[0]), int(args[1]))
+
+def _builtin_pow(args, mem, input_fn):
+    if len(args) < 2:
+        raise BuiltinError("pow: expected 2 arguments")
+    base = int(args[0])
+    exp  = int(args[1])
+    if exp < 0:
+        return 0
+    return int(base ** exp)
+
+def _builtin_sqrt(args, mem, input_fn):
+    if len(args) < 1:
+        raise BuiltinError("sqrt: expected 1 argument")
+    x = int(args[0])
+    if x < 0:
+        raise BuiltinError("Runtime error: sqrt() argument must be non-negative")
+    return int(math.sqrt(x))
+
+def _builtin_mod(args, mem, input_fn):
+    if len(args) < 2:
+        raise BuiltinError("mod: expected 2 arguments")
+    a, b = int(args[0]), int(args[1])
+    if b == 0:
+        raise BuiltinError("Runtime error: division by zero in mod()")
+    return a % b
+
+def _builtin_rand(args, mem, input_fn):
+    return random.randint(0, 32767)
+
+def _builtin_srand(args, mem, input_fn):
+    if len(args) < 1:
+        raise BuiltinError("srand: expected 1 argument")
+    random.seed(int(args[0]))
+    return 0
+
+# 工具函式
+def _builtin_memset(args, mem, input_fn):
+    if len(args) < 3:
+        raise BuiltinError("memset: expected 3 arguments")
+    mem.memset(int(args[0]), int(args[1]), int(args[2]))
+    return int(args[0])
+
+def _builtin_sizeof_int(args, mem, input_fn):
+    return 4
+
+def _builtin_sizeof_char(args, mem, input_fn):
+    return 1
+
+def _builtin_atoi(args, mem, input_fn):
+    if len(args) < 1:
+        raise BuiltinError("atoi: expected 1 argument")
+    s = mem.read_string(int(args[0]))
+    s = s.strip()
+    try:
+        # 處理正負號
+        return int(s)
+    except ValueError:
+        return 0
+
+def _builtin_itoa(args, mem, input_fn):
+    if len(args) < 2:
+        raise BuiltinError("itoa: expected 2 arguments")
+    val  = int(args[0])
+    addr = int(args[1])
+    s    = str(val)
+    mem.write_string(addr, s)
+    return 0
+
+def _builtin_exit(args, mem, input_fn):
+    code = int(args[0]) if args else 0
+    raise ExitCalled(code)
+
+
+# ──────────────────────────────────────────
+# 函式簽名表（用於 FUNCS 指令顯示與型別檢查）
+# ──────────────────────────────────────────
+
+BUILTIN_SIGNATURES = {
+    # name: (rtype, params)
+    # params: list of (dtype, is_ptr, name)
+    'putchar':    ('int',  [('int',  False, 'ch')]),
+    'getchar':    ('int',  []),
+    'printf':     ('void', [('char', True,  'fmt')]),
+    'puts':       ('void', [('char', True,  's')]),
+    'scanf':      ('int',  [('char', True,  'fmt')]),
+    'strlen':     ('int',  [('char', True,  's')]),
+    'strcpy':     ('void', [('char', True,  'dest'), ('char', True, 'src')]),
+    'strcat':     ('void', [('char', True,  'dest'), ('char', True, 'src')]),
+    'strcmp':     ('int',  [('char', True,  's1'),   ('char', True, 's2')]),
+    'abs':        ('int',  [('int',  False, 'x')]),
+    'max':        ('int',  [('int',  False, 'a'),    ('int',  False, 'b')]),
+    'min':        ('int',  [('int',  False, 'a'),    ('int',  False, 'b')]),
+    'pow':        ('int',  [('int',  False, 'base'), ('int',  False, 'exp')]),
+    'sqrt':       ('int',  [('int',  False, 'x')]),
+    'mod':        ('int',  [('int',  False, 'a'),    ('int',  False, 'b')]),
+    'rand':       ('int',  []),
+    'srand':      ('void', [('int',  False, 'seed')]),
+    'memset':     ('void', [('char', True,  'ptr'),
+                            ('int',  False, 'value'),
+                            ('int',  False, 'size')]),
+    'sizeof_int':  ('int', []),
+    'sizeof_char': ('int', []),
+    'atoi':       ('int',  [('char', True,  's')]),
+    'itoa':       ('void', [('int',  False, 'value'), ('char', True, 'str')]),
+    'exit':       ('void', [('int',  False, 'code')]),
+}
+
+# 實作對應表
+BUILTIN_IMPLS = {
+    'putchar':    _builtin_putchar,
+    'getchar':    _builtin_getchar,
+    'printf':     _builtin_printf,
+    'puts':       _builtin_puts,
+    'scanf':      _builtin_scanf,
+    'strlen':     _builtin_strlen,
+    'strcpy':     _builtin_strcpy,
+    'strcat':     _builtin_strcat,
+    'strcmp':     _builtin_strcmp,
+    'abs':        _builtin_abs,
+    'max':        _builtin_max,
+    'min':        _builtin_min,
+    'pow':        _builtin_pow,
+    'sqrt':       _builtin_sqrt,
+    'mod':        _builtin_mod,
+    'rand':       _builtin_rand,
+    'srand':      _builtin_srand,
+    'memset':     _builtin_memset,
+    'sizeof_int':  _builtin_sizeof_int,
+    'sizeof_char': _builtin_sizeof_char,
+    'atoi':       _builtin_atoi,
+    'itoa':       _builtin_itoa,
+    'exit':       _builtin_exit,
+}
+
+
+# ──────────────────────────────────────────
+# 公開介面
+# ──────────────────────────────────────────
+
+def register_builtins(sym: SymbolTable):
+    """將所有內建函式登記到符號表。"""
+    for name, (rtype, params) in BUILTIN_SIGNATURES.items():
+        entry = FuncEntry(
+            rtype=rtype,
+            params=params,
+            node=None,
+            is_builtin=True,
+        )
+        sym.declare_func(name, entry)
+
+
+def call_builtin(name: str, args: list,
+                 mem: Memory, input_fn=None):
+    """
+    呼叫一個內建函式。
+    name     : 函式名稱
+    args     : 已求值的引數列表（Python int）
+    mem      : Memory 物件
+    input_fn : 可替換的輸入函式（測試用），預設為 None（用 input()）
+    回傳值   : int 或 None（void 函式）
+    """
+    impl = BUILTIN_IMPLS.get(name)
+    if impl is None:
+        raise BuiltinError(f"unknown built-in function: '{name}'")
+    result = impl(args, mem, input_fn)
+    return 0 if result is None else result
+
+
+def is_builtin(name: str) -> bool:
+    return name in BUILTIN_IMPLS
+</file>
+
+<file path="symtable.py">
+"""
+Small-C Symbol Table
+管理變數與函式的宣告、型別、作用域。
+
+設計：
+  - 用「scope stack」實作巢狀作用域
+  - 全域 scope 在最底層（index 0）
+  - 每次進入函式就 push 一個新 scope
+  - 離開函式就 pop
+  - 變數查找從最內層 scope 往外找（遮蔽規則）
+
+變數記錄（VarEntry）：
+  dtype   : 'int' | 'char'
+  is_ptr  : bool
+  is_arr  : bool
+  size    : int（陣列元素數，非陣列為 1）
+  addr    : int（記憶體位址）
+  cell_size: int（每個元素佔幾個 cell：int→4, char→1）
+
+函式記錄（FuncEntry）：
+  rtype  : 'int' | 'char' | 'void'
+  params : list of (dtype, is_ptr, name)
+  node   : FuncDef AST 節點（None 表示內建）
+  is_builtin: bool
+"""
+
+from dataclasses import dataclass, field
+from typing import Optional, Any
+
+
+class SymbolError(Exception):
+    def __init__(self, msg, line=0):
+        super().__init__(msg)
+        self.line = line
+
+
+# ──────────────────────────────────────────
+# 記錄型別
+# ──────────────────────────────────────────
+
+@dataclass
+class VarEntry:
+    dtype    : str          # 'int' | 'char'
+    is_ptr   : bool = False
+    is_arr   : bool = False
+    size     : int  = 1     # 陣列元素數（非陣列為 1）
+    addr     : int  = 0     # 記憶體位址
+    cell_size: int  = 4     # int=4, char=1
+
+    def elem_size(self) -> int:
+        """單一元素佔幾個 cell"""
+        return 1 if self.dtype == 'char' else 4
+
+    def total_cells(self) -> int:
+        """整個變數佔幾個 cell"""
+        return self.size * self.elem_size()
+
+
+@dataclass
+class FuncEntry:
+    rtype     : str                    # 'int' | 'char' | 'void'
+    params    : list = field(default_factory=list)
+    node      : Any  = None            # FuncDef AST 節點
+    is_builtin: bool = False
+
+
+# ──────────────────────────────────────────
+# SymbolTable
+# ──────────────────────────────────────────
+
+class SymbolTable:
+    def __init__(self):
+        # scope stack：每個元素是 dict[name → VarEntry]
+        self._scopes: list[dict] = [{}]   # index 0 = 全域
+
+        # 函式表（全域唯一）
+        self._funcs: dict[str, FuncEntry] = {}
+
+        # #define 常數表
+        self._defines: dict[str, int] = {}
+
+    # ─────────────────── Scope 管理 ───────────────────
+
+    def push_scope(self):
+        """進入新作用域（進入函式或區塊）"""
+        self._scopes.append({})
+
+    def pop_scope(self):
+        """離開目前作用域"""
+        if len(self._scopes) <= 1:
+            raise SymbolError("cannot pop global scope")
+        self._scopes.pop()
+
+    def current_depth(self) -> int:
+        """目前作用域深度（0 = 全域）"""
+        return len(self._scopes) - 1
+
+    def is_global(self) -> bool:
+        return len(self._scopes) == 1
+
+    # ─────────────────── 變數操作 ───────────────────
+
+    def declare_var(self, name: str, entry: VarEntry, line: int = 0):
+        """在目前作用域宣告一個變數。若同層已宣告則報錯。"""
+        current = self._scopes[-1]
+        if name in current:
+            raise SymbolError(
+                f"variable '{name}' already declared in this scope", line)
+        current[name] = entry
+
+    def lookup_var(self, name: str, line: int = 0) -> VarEntry:
+        """從最內層往外找變數，找不到則報錯。"""
+        for scope in reversed(self._scopes):
+            if name in scope:
+                return scope[name]
+        raise SymbolError(f"undefined variable '{name}'", line)
+
+    def lookup_var_safe(self, name: str) -> Optional[VarEntry]:
+        """找不到時回傳 None 而非拋出例外。"""
+        for scope in reversed(self._scopes):
+            if name in scope:
+                return scope[name]
+        return None
+
+    def update_var(self, name: str, addr: int = None,
+                   value_hint=None, line: int = 0) -> VarEntry:
+        """更新已宣告變數的位址（分配記憶體後回填）。"""
+        for scope in reversed(self._scopes):
+            if name in scope:
+                if addr is not None:
+                    scope[name].addr = addr
+                return scope[name]
+        raise SymbolError(f"undefined variable '{name}'", line)
+
+    def all_global_vars(self) -> dict:
+        """回傳全域作用域的所有變數（VARS 指令用）。"""
+        return dict(self._scopes[0])
+
+    def all_current_vars(self) -> dict:
+        """回傳所有可見變數（含所有層，內層遮蔽外層）。"""
+        merged = {}
+        for scope in self._scopes:
+            merged.update(scope)
+        return merged
+
+    # ─────────────────── 函式操作 ───────────────────
+
+    def declare_func(self, name: str, entry: FuncEntry, line: int = 0):
+        """宣告一個函式（全域）。"""
+        # 允許重複宣告內建函式（不報錯）
+        if name in self._funcs and not self._funcs[name].is_builtin:
+            raise SymbolError(f"function '{name}' already defined", line)
+        self._funcs[name] = entry
+
+    def lookup_func(self, name: str, line: int = 0) -> FuncEntry:
+        """查找函式，找不到則報錯。"""
+        if name not in self._funcs:
+            raise SymbolError(f"undefined function '{name}'", line)
+        return self._funcs[name]
+
+    def lookup_func_safe(self, name: str) -> Optional[FuncEntry]:
+        return self._funcs.get(name)
+
+    def all_funcs(self) -> dict:
+        """回傳所有函式（FUNCS 指令用）。"""
+        return dict(self._funcs)
+
+    def user_funcs(self) -> dict:
+        """只回傳使用者定義的函式。"""
+        return {k: v for k, v in self._funcs.items() if not v.is_builtin}
+
+    def builtin_funcs(self) -> dict:
+        """只回傳內建函式。"""
+        return {k: v for k, v in self._funcs.items() if v.is_builtin}
+
+    # ─────────────────── #define 常數 ───────────────────
+
+    def define(self, name: str, value: int):
+        self._defines[name] = value
+
+    def lookup_define(self, name: str) -> Optional[int]:
+        return self._defines.get(name)
+
+    def all_defines(self) -> dict:
+        return dict(self._defines)
+
+    # ─────────────────── 重置 ───────────────────
+
+    def reset(self):
+        """完全重置（NEW 指令用）。保留內建函式。"""
+        builtins = {k: v for k, v in self._funcs.items() if v.is_builtin}
+        self._scopes  = [{}]
+        self._funcs   = builtins
+        self._defines = {}
+
+    def reset_globals(self):
+        """只清除全域變數（RUN 前清除殘留狀態）。"""
+        self._scopes = [{}]
+        self._defines = {}
+        # 保留函式表（使用者定義 + 內建）
+
+    # ─────────────────── 除錯輸出 ───────────────────
+
+    def dump_vars(self) -> str:
+        """格式化輸出所有可見變數（VARS 指令）。"""
+        lines = []
+        seen = set()
+        for scope in reversed(self._scopes):
+            for name, entry in scope.items():
+                if name in seen:
+                    continue
+                seen.add(name)
+                lines.append(_format_var(name, entry))
+        return '\n'.join(lines) if lines else '(no variables)'
+
+    def dump_funcs(self, memory=None) -> str:
+        """格式化輸出所有函式（FUNCS 指令）。"""
+        lines = []
+        # 使用者定義函式優先
+        for name, entry in self._funcs.items():
+            if not entry.is_builtin:
+                params_str = _format_params(entry.params)
+                line_no = entry.node.line if entry.node else '?'
+                lines.append(
+                    f"  {entry.rtype:<6} {name}({params_str})"
+                    f"{'':>4} line {line_no}"
+                )
+        # 內建函式
+        lines.append("  --- built-in functions ---")
+        for name, entry in self._funcs.items():
+            if entry.is_builtin:
+                params_str = _format_params(entry.params)
+                lines.append(
+                    f"  {entry.rtype:<6} {name}({params_str})"
+                    f"{'':>4} [built-in]"
+                )
+        return '\n'.join(lines) if lines else '(no functions)'
+
+
+# ──────────────────────────────────────────
+# 格式化輔助
+# ──────────────────────────────────────────
+
+def _format_var(name: str, entry: VarEntry) -> str:
+    ptr_mark = '*' if entry.is_ptr else ''
+    if entry.is_arr:
+        # 陣列：顯示前 10 個元素
+        return f"  {entry.dtype} {ptr_mark}{name}[{entry.size}]  addr={entry.addr}"
+    else:
+        return f"  {entry.dtype} {ptr_mark}{name}  addr={entry.addr}"
+
+
+def _format_params(params: list) -> str:
+    if not params:
+        return ''
+    parts = []
+    for item in params:
+        if isinstance(item, tuple):
+            if len(item) == 3:
+                dtype, is_ptr, pname = item
+                parts.append(f"{dtype} {'*' if is_ptr else ''}{pname}")
+            else:
+                parts.append(str(item))
+        else:
+            parts.append(str(item))
+    return ', '.join(parts)
+</file>
+
+</files>

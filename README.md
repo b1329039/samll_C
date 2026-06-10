@@ -19,7 +19,7 @@ Small-C is a subset of the C programming language, originally designed for micro
 
 ## Features
 
-- **Standard C Syntax** — Supports `int`, `char`, pointers, arrays, and standard control flow (`if-else`, `while`, `for`, `do-while`).
+- **Standard C Syntax** — Supports `int`, `char`, pointers, arrays, and standard control flow (`if-else`, `while`, `for`, `do-while`,`swith-case`).
 - **Rich Expression Support** — Implements 13 levels of operator precedence, including pointer arithmetic (`&`, `*`) and compound assignments (`+=`, `*=`, etc.).
 - **Dynamic REPL Environment** — Interactive shell with commands like `APPEND`, `EDIT`, `LIST`, `VARS`, and `TRACE`.
 - **Integrated Debugger** — Real-time execution tracing and variable/function table inspection.

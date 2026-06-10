@@ -7,10 +7,11 @@ import sys
 from memory import Memory, MemoryError
 from symtable import SymbolTable, VarEntry, FuncEntry, SymbolError
 from smallc_builtins import (register_builtins, call_builtin,
-                              is_builtin, ExitCalled, BuiltinError)
+                              is_builtin, ExitCalled, BuiltinError,
+                              clear_scanf_buffer)
 from parser import (
     Program, FuncDef, VarDecl, Define, Block,
-    IfStmt, WhileStmt, ForStmt, DoWhileStmt,
+    IfStmt, WhileStmt, ForStmt, DoWhileStmt, SwitchStmt,
     BreakStmt, ContinueStmt, ReturnStmt, ExprStmt,
     BinOp, UnaryOp, Assign, Ident, ArrayIndex,
     FuncCall, IntLit, CharLit, StrLit,
@@ -43,6 +44,7 @@ class Interpreter:
         self.mem = Memory()
         self.sym.reset()
         register_builtins(self.sym)
+        clear_scanf_buffer()
 
     # ── 完整程式執行 ──
 
@@ -59,19 +61,22 @@ class Interpreter:
 
         for decl in ast.decls:
             self._register_top(decl)
-        for decl in ast.decls:
-            if isinstance(decl, VarDecl):
-                self._init_global_var(decl)
-
-        fe = self.sym.lookup_func_safe('main')
-        if fe is None or fe.is_builtin:
-            raise RuntimeError_("No main() function defined.")
-
+            
         try:
+            for decl in ast.decls:
+                if isinstance(decl, VarDecl):
+                    self._init_global_var(decl)
+
+            fe = self.sym.lookup_func_safe('main')
+            if fe is None or fe.is_builtin:
+                raise RuntimeError_("No main() function defined.")
+
             ret = self._call_user_func(fe, [])
             code = ret if ret is not None else 0
         except ReturnSignal as r:
             code = r.value
+        except (MemoryError, SymbolError) as e:
+            raise RuntimeError_(f"Runtime error: {e}")
         except ExitCalled as e:
             print(f"Program exited with return value {e.code}.")
             return
@@ -172,6 +177,14 @@ class Interpreter:
         if self.trace and hasattr(stmt, 'line') and stmt.line:
             print(f"[line {stmt.line}] {self._stmt_src(stmt)}")
 
+        try:
+            self._do_exec_stmt(stmt)
+        except MemoryError as e:
+            raise RuntimeError_(f"Memory error: {e}", getattr(stmt, 'line', 0))
+        except SymbolError as e:
+            raise RuntimeError_(f"Symbol error: {e}", getattr(stmt, 'line', 0))
+
+    def _do_exec_stmt(self, stmt):
         if isinstance(stmt, ExprStmt):
             self._eval_expr(stmt.expr)
 
@@ -241,6 +254,29 @@ class Interpreter:
                     pass
                 if not self._eval_expr(stmt.cond):
                     break
+
+        elif isinstance(stmt, SwitchStmt):
+            val = self._eval_expr(stmt.cond)
+            found = False
+            for c_val_expr, c_stmt in stmt.cases:
+                if self._eval_expr(c_val_expr) == val:
+                    found = True
+                    try:
+                        # 這裡我們需要處理 fall-through
+                        # 但 Small-C 規格通常較簡單，這裡實作基本的 fall-through 邏輯
+                        idx = stmt.cases.index((c_val_expr, c_stmt))
+                        for i in range(idx, len(stmt.cases)):
+                            self._exec_stmt(stmt.cases[i][1])
+                        if stmt.default_stmt:
+                            self._exec_stmt(stmt.default_stmt)
+                    except BreakSignal:
+                        pass
+                    break
+            if not found and stmt.default_stmt:
+                try:
+                    self._exec_stmt(stmt.default_stmt)
+                except BreakSignal:
+                    pass
 
         elif isinstance(stmt, BreakStmt):
             raise BreakSignal()
@@ -319,13 +355,32 @@ class Interpreter:
             return self.mem.read(int(ptr))
         if op == '++pre':
             addr = self._eval_lvalue_addr(node.operand)
-            val  = self.mem.read(addr) + 1
+            step = self._get_step(node.operand)
+            val  = self.mem.read(addr) + step
             self.mem.write(addr, val); return val
         if op == '--pre':
             addr = self._eval_lvalue_addr(node.operand)
-            val  = self.mem.read(addr) - 1
+            step = self._get_step(node.operand)
+            val  = self.mem.read(addr) - step
             self.mem.write(addr, val); return val
+        if op == 'post++':
+            addr = self._eval_lvalue_addr(node.operand)
+            step = self._get_step(node.operand)
+            val  = self.mem.read(addr)
+            self.mem.write(addr, val + step); return val
+        if op == 'post--':
+            addr = self._eval_lvalue_addr(node.operand)
+            step = self._get_step(node.operand)
+            val  = self.mem.read(addr)
+            self.mem.write(addr, val - step); return val
         raise RuntimeError_(f"Unknown unary: {op}")
+
+    def _get_step(self, node):
+        if isinstance(node, Ident):
+            entry = self.sym.lookup_var_safe(node.name)
+            if entry and (entry.is_ptr or entry.is_arr):
+                return entry.elem_size()
+        return 1
 
     def _eval_binop(self, node):
         op = node.op

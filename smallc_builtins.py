@@ -94,13 +94,17 @@ def _do_printf(fmt: str, args: list, mem: Memory) -> str:
 # scanf 格式化輸入
 # ──────────────────────────────────────────
 
+_scanf_buffer = []
+
 def _do_scanf(fmt: str, arg_addrs: list, mem: Memory,
               input_fn=None) -> int:
     """
     解析 scanf 格式字串，從 stdin 讀取並寫入對應位址。
     支援：%d %c
+    支援單行多個輸入（Token 緩衝區）。
     回傳成功讀取的項目數。
     """
+    global _scanf_buffer
     if input_fn is None:
         input_fn = input
 
@@ -120,24 +124,43 @@ def _do_scanf(fmt: str, arg_addrs: list, mem: Memory,
 
         addr = arg_addrs[arg_idx]; arg_idx += 1
 
-        if spec == 'd':
+        # 若緩衝區空了，則讀取新行
+        if not _scanf_buffer:
             try:
                 line = input_fn()
-                val = int(line.strip())
+                if line is None: break
+                _scanf_buffer = line.split()
+            except (EOFError, KeyboardInterrupt):
+                break
+        
+        if not _scanf_buffer:
+            break
+
+        if spec == 'd':
+            try:
+                token = _scanf_buffer.pop(0)
+                val = int(token)
                 mem.write(int(addr), val)
                 count += 1
-            except (ValueError, EOFError):
+            except (ValueError, IndexError):
                 break
         elif spec == 'c':
             try:
-                line = input_fn()
-                if line:
-                    mem.write(int(addr), ord(line[0]))
-                    count += 1
-            except EOFError:
+                token = _scanf_buffer.pop(0)
+                mem.write(int(addr), ord(token[0]))
+                count += 1
+                # 若 token 還有剩餘字元，放回緩衝區供下次使用
+                if len(token) > 1:
+                    _scanf_buffer.insert(0, token[1:])
+            except (IndexError, EOFError):
                 break
 
     return count
+
+
+def clear_scanf_buffer():
+    global _scanf_buffer
+    _scanf_buffer = []
 
 
 # ──────────────────────────────────────────

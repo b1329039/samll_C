@@ -126,6 +126,13 @@ class DoWhileStmt(Node):
         self.cond = cond
         self.line = line
 
+class SwitchStmt(Node):
+    def __init__(self, cond, cases, default_stmt=None, line=0):
+        self.cond         = cond
+        self.cases        = cases        # list of (value, stmt)
+        self.default_stmt = default_stmt # stmt (optional)
+        self.line         = line
+
 class BreakStmt(Node):
     def __init__(self, line=0): self.line = line
 
@@ -297,8 +304,18 @@ class Parser:
         line = self.current_line()
         self.expect(T.LBRACE)
         stmts = []
+        
+        # 嚴格規則：變數宣告必須在區塊開頭
+        parsing_decls = True
         while not self.check(T.RBRACE) and not self.check(T.EOF):
-            stmts.append(self._parse_stmt())
+            if self.check(T.INT, T.CHAR):
+                if not parsing_decls:
+                    raise ParseError("區域變數宣告必須在區塊開頭", self.current_line())
+                stmts.append(self._parse_local_var_decl())
+            else:
+                parsing_decls = False
+                stmts.append(self._parse_stmt())
+                
         self.expect(T.RBRACE)
         return Block(stmts, line)
 
@@ -320,6 +337,9 @@ class Parser:
         if tok.type == T.DO:
             return self._parse_do_while()
 
+        if tok.type == T.SWITCH:
+            return self._parse_switch()
+
         if tok.type == T.BREAK:
             self.advance()
             self.expect(T.SEMICOLON)
@@ -340,11 +360,11 @@ class Parser:
             self.defines[name] = val
             return Define(name, val_str, tok.line)
 
-        # 變數宣告：int / char 開頭
+        # 變數宣告：在 _parse_stmt 中移除，改由 _parse_block 處理開頭宣告
         if tok.type in (T.INT, T.CHAR):
-            return self._parse_local_var_decl()
+            raise ParseError("區域變數宣告必須在區塊開頭", tok.line)
 
-        # void 開頭（幾乎不會在陳述句出現，但防禦一下）
+        # void 開頭
         if tok.type == T.VOID:
             raise ParseError("void 不可作為區域變數型別", tok.line)
 
@@ -439,6 +459,40 @@ class Parser:
         self.expect(T.RPAREN)
         self.expect(T.SEMICOLON)
         return DoWhileStmt(body, cond, line)
+
+    def _parse_switch(self):
+        line = self.current_line()
+        self.expect(T.SWITCH)
+        self.expect(T.LPAREN)
+        cond = self._parse_expr()
+        self.expect(T.RPAREN)
+        self.expect(T.LBRACE)
+
+        cases = []
+        default_stmt = None
+
+        while not self.check(T.RBRACE) and not self.check(T.EOF):
+            if self.match(T.CASE):
+                val = self._parse_expr()
+                self.expect(T.COLON)
+                stmts = []
+                # 解析 case 下的多個陳述句，直到下一個 case, default 或 }
+                while not self.check(T.CASE, T.DEFAULT, T.RBRACE, T.EOF):
+                    stmts.append(self._parse_stmt())
+                cases.append((val, Block(stmts, line)))
+            elif self.match(T.DEFAULT):
+                self.expect(T.COLON)
+                stmts = []
+                while not self.check(T.CASE, T.DEFAULT, T.RBRACE, T.EOF):
+                    stmts.append(self._parse_stmt())
+                default_stmt = Block(stmts, line)
+            else:
+                # 允許 switch 內有其他陳述句（雖然通常不建議，但 C 語法允許）
+                # 這裡為了簡單，我們只預期 case 或 default
+                raise ParseError("switch 區塊內應包含 case 或 default", self.current_line())
+
+        self.expect(T.RBRACE)
+        return SwitchStmt(cond, cases, default_stmt, line)
 
     def _parse_return(self):
         line = self.current_line()
@@ -601,7 +655,7 @@ class Parser:
         return self._parse_postfix()
 
     def _parse_postfix(self):
-        """優先序 1：後綴（函式呼叫、陣列索引）"""
+        """優先序 1：後綴（函式呼叫、陣列索引、後綴 ++/--）"""
         node = self._parse_primary()
         while True:
             line = self.current_line()
@@ -609,6 +663,10 @@ class Parser:
                 idx = self._parse_expr()
                 self.expect(T.RBRACKET)
                 node = ArrayIndex(node, idx, line)
+            elif self.match(T.INC):
+                node = UnaryOp('post++', node, line)
+            elif self.match(T.DEC):
+                node = UnaryOp('post--', node, line)
             elif self.check(T.LPAREN):
                 # 函式呼叫（primary 已處理識別字函式呼叫）
                 # 這裡處理函式指標呼叫等邊緣情況

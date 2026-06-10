@@ -26,6 +26,9 @@ class TokenType(Enum):
     BREAK      = auto()
     CONTINUE   = auto()
     RETURN     = auto()
+    SWITCH     = auto()
+    CASE       = auto()
+    DEFAULT    = auto()
     DEFINE     = auto()  # #define
 
     # Operators
@@ -67,6 +70,7 @@ class TokenType(Enum):
     RBRACKET   = auto()  # ]
     SEMICOLON  = auto()  # ;
     COMMA      = auto()  # ,
+    COLON      = auto()  # :
 
     # Special
     EOF        = auto()
@@ -84,6 +88,9 @@ KEYWORDS = {
     'break': TokenType.BREAK,
     'continue': TokenType.CONTINUE,
     'return': TokenType.RETURN,
+    'switch': TokenType.SWITCH,
+    'case': TokenType.CASE,
+    'default': TokenType.DEFAULT,
 }
 
 
@@ -293,6 +300,7 @@ def tokenize(source: str, start_line: int = 1):
             ']': TokenType.RBRACKET,
             ';': TokenType.SEMICOLON,
             ',': TokenType.COMMA,
+            ':': TokenType.COLON,
         }
         if c in one_map:
             tokens.append(Token(one_map[c], c, line, col()))
